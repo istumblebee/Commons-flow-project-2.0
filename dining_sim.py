@@ -1,5 +1,5 @@
 """
-Dining Hall Flow Simulator v2.2
+Dining Hall Flow Simulator v2.3
 ================================
 Agent-based simulation for analyzing dining hall bottlenecks.
 
@@ -9,6 +9,9 @@ Controls:
     +/-        - Speed up/slow down simulation
     R          - Reset simulation
     Q/ESC      - Quit
+
+When Paused:
+    Click on a student to see their stats
 
 Editor Mode:
     0          - Select tool (click items to edit)
@@ -40,19 +43,20 @@ from tkinter import filedialog
 # CONFIGURATION
 # ============================================================================
 
-WINDOW_WIDTH = 1400
-WINDOW_HEIGHT = 900
-PANEL_WIDTH = 300
+WINDOW_WIDTH = 1500
+WINDOW_HEIGHT = 950
+PANEL_WIDTH = 280
 GRID_SIZE = 8
 
 STUDENT_RADIUS = 5
 STUDENT_SPAWN_RATE = 80
 STUDENT_SPEED = 1.8
-SEPARATION_RADIUS = 14
-SEPARATION_FORCE = 0.6
-WALL_AVOIDANCE_RADIUS = 15
-WALL_AVOIDANCE_FORCE = 1.2
-TABLE_AVOIDANCE_RADIUS = 12
+SEPARATION_RADIUS = 16
+SEPARATION_FORCE = 1.2
+WALL_AVOIDANCE_RADIUS = 18
+WALL_AVOIDANCE_FORCE = 1.5
+TABLE_AVOIDANCE_RADIUS = 14
+QUEUE_SPACING = 20
 
 DIET_DISTRIBUTION = {
     "omnivore": 0.55,
@@ -80,6 +84,7 @@ COLORS = {
     "student_allergen": (255, 180, 220),
     "student_halal": (180, 220, 255),
     "student_has_food": (180, 130, 80),
+    "student_selected": (255, 255, 255),
     "table": (110, 75, 35),
     "table_occupied": (80, 50, 20),
     "dish_return": (100, 100, 120),
@@ -184,7 +189,7 @@ class Station:
     food_categories: Set[str] = field(default_factory=lambda: {"pizza"})
     popularity: float = 0.5
     service_time: float = 6.0
-    capacity: int = 3
+    capacity: int = 1  # How many can be served at once
     queue: list = field(default_factory=list)
     being_served: list = field(default_factory=list)
     service_timers: dict = field(default_factory=dict)
@@ -192,9 +197,9 @@ class Station:
 
     # Flow-through zone settings
     is_flow_through: bool = False
-    flow_entry_side: str = "left"  # left, right, top, bottom
+    flow_entry_side: str = "left"
     flow_exit_side: str = "right"
-    flow_positions: list = field(default_factory=list)  # Students currently flowing through
+    flow_positions: list = field(default_factory=list)
 
     @property
     def center(self):
@@ -207,7 +212,7 @@ class Station:
             return (self.x + self.width + 10, self.y + self.height // 2)
         elif self.flow_entry_side == "top":
             return (self.x + self.width // 2, self.y - 10)
-        else:  # bottom
+        else:
             return (self.x + self.width // 2, self.y + self.height + 10)
 
     def get_flow_exit_point(self) -> Tuple[int, int]:
@@ -221,7 +226,6 @@ class Station:
             return (self.x + self.width // 2, self.y + self.height + 10)
 
     def get_flow_path(self, num_points: int = 5) -> List[Tuple[int, int]]:
-        """Get waypoints through the flow zone"""
         entry = self.get_flow_entry_point()
         exit_pt = self.get_flow_exit_point()
         path = []
@@ -232,40 +236,39 @@ class Station:
             path.append((int(px), int(py)))
         return path
 
-    @property
-    def service_positions(self) -> List[Tuple[int, int]]:
-        positions = []
-        spacing = self.width // (self.capacity + 1)
-        for i in range(self.capacity):
-            px = self.x + spacing * (i + 1)
-            py = self.y + self.height // 2
-            positions.append((px, py))
-        return positions
-
-    def get_queue_positions(self, count: int) -> List[Tuple[int, int]]:
-        positions = []
-        spacing = SEPARATION_RADIUS + 3
+    def get_service_point(self) -> Tuple[int, int]:
+        """The point where a student stands to be served"""
         if self.queue_direction == "down":
-            start_x = self.x + self.width // 2
-            start_y = self.y + self.height + 12
-            for i in range(count):
-                positions.append((start_x, start_y + i * spacing))
+            return (self.x + self.width // 2, self.y + self.height + 15)
         elif self.queue_direction == "up":
-            start_x = self.x + self.width // 2
-            start_y = self.y - 12
-            for i in range(count):
-                positions.append((start_x, start_y - i * spacing))
+            return (self.x + self.width // 2, self.y - 15)
         elif self.queue_direction == "left":
-            start_x = self.x - 12
-            start_y = self.y + self.height // 2
-            for i in range(count):
-                positions.append((start_x - i * spacing, start_y))
+            return (self.x - 15, self.y + self.height // 2)
         else:
-            start_x = self.x + self.width + 12
-            start_y = self.y + self.height // 2
-            for i in range(count):
-                positions.append((start_x + i * spacing, start_y))
-        return positions
+            return (self.x + self.width + 15, self.y + self.height // 2)
+
+    def get_queue_position(self, index: int, walls: list = None) -> Tuple[int, int]:
+        """Get position for person at index in queue (0 = being served)"""
+        service_pt = self.get_service_point()
+        if index == 0:
+            return service_pt
+
+        # Direction vector for queue
+        dx, dy = 0, 0
+        if self.queue_direction == "down":
+            dy = 1
+        elif self.queue_direction == "up":
+            dy = -1
+        elif self.queue_direction == "left":
+            dx = -1
+        else:
+            dx = 1
+
+        # Calculate position
+        px = service_pt[0] + dx * index * QUEUE_SPACING
+        py = service_pt[1] + dy * index * QUEUE_SPACING
+
+        return (int(px), int(py))
 
     def can_serve_diet(self, diet: DietType) -> bool:
         if diet == DietType.VEGAN:
@@ -290,7 +293,7 @@ class Table:
     x: int
     y: int
     seats: int = 4
-    shape: str = "circle"  # circle or square
+    shape: str = "circle"
     occupied_by: list = field(default_factory=list)
 
     @property
@@ -303,7 +306,6 @@ class Table:
 
     @property
     def radius(self):
-        # Size based on seats
         if self.seats <= 2:
             return 14
         elif self.seats <= 4:
@@ -353,37 +355,41 @@ class DishReturn:
     height: int
     queue: list = field(default_factory=list)
     being_served: list = field(default_factory=list)
-    capacity: int = 2
+    capacity: int = 1
     queue_direction: str = "down"
 
     @property
     def center(self):
         return (self.x + self.width // 2, self.y + self.height // 2)
 
-    def get_queue_positions(self, count: int) -> List[Tuple[int, int]]:
-        positions = []
-        spacing = SEPARATION_RADIUS + 3
+    def get_service_point(self) -> Tuple[int, int]:
         if self.queue_direction == "down":
-            start_x = self.x + self.width // 2
-            start_y = self.y + self.height + 12
-            for i in range(count):
-                positions.append((start_x, start_y + i * spacing))
+            return (self.x + self.width // 2, self.y + self.height + 15)
         elif self.queue_direction == "up":
-            start_x = self.x + self.width // 2
-            start_y = self.y - 12
-            for i in range(count):
-                positions.append((start_x, start_y - i * spacing))
+            return (self.x + self.width // 2, self.y - 15)
         elif self.queue_direction == "left":
-            start_x = self.x - 12
-            start_y = self.y + self.height // 2
-            for i in range(count):
-                positions.append((start_x - i * spacing, start_y))
+            return (self.x - 15, self.y + self.height // 2)
         else:
-            start_x = self.x + self.width + 12
-            start_y = self.y + self.height // 2
-            for i in range(count):
-                positions.append((start_x + i * spacing, start_y))
-        return positions
+            return (self.x + self.width + 15, self.y + self.height // 2)
+
+    def get_queue_position(self, index: int) -> Tuple[int, int]:
+        service_pt = self.get_service_point()
+        if index == 0:
+            return service_pt
+
+        dx, dy = 0, 0
+        if self.queue_direction == "down":
+            dy = 1
+        elif self.queue_direction == "up":
+            dy = -1
+        elif self.queue_direction == "left":
+            dx = -1
+        else:
+            dx = 1
+
+        px = service_pt[0] + dx * index * QUEUE_SPACING
+        py = service_pt[1] + dy * index * QUEUE_SPACING
+        return (int(px), int(py))
 
 
 @dataclass
@@ -418,17 +424,21 @@ class Student:
     path: list = field(default_factory=list)
     target_station: Station = None
     target_table: Table = None
+    target_dish_return: DishReturn = None
     seat_position: tuple = None
+    queue_position: int = -1
     speed: float = STUDENT_SPEED
     eat_timer: int = 0
     has_food: bool = False
+    has_dessert: bool = False  # Track if they got dessert
     meals_eaten: int = 0
     time_in_system: int = 0
     wait_time: int = 0
     vx: float = 0
     vy: float = 0
     stuck_timer: int = 0
-    flow_progress: int = 0  # For flow-through zones
+    flow_progress: int = 0
+    stations_visited: list = field(default_factory=list)  # Track visited stations
 
     @property
     def color(self):
@@ -443,6 +453,23 @@ class Student:
     @property
     def pos(self):
         return (self.x, self.y)
+
+    def get_state_description(self) -> str:
+        descriptions = {
+            StudentState.ENTERING: "Just entered",
+            StudentState.WALKING_TO_STATION: f"Walking to {self.target_station.name if self.target_station else 'station'}",
+            StudentState.IN_FLOW_ZONE: f"In flow zone at {self.target_station.name if self.target_station else 'station'}",
+            StudentState.QUEUING: f"Waiting in queue at {self.target_station.name if self.target_station else 'station'}",
+            StudentState.BEING_SERVED: f"Being served at {self.target_station.name if self.target_station else 'station'}",
+            StudentState.WALKING_TO_TABLE: "Finding a table",
+            StudentState.EATING: "Eating",
+            StudentState.WALKING_TO_DISH_RETURN: "Going to return dishes",
+            StudentState.QUEUING_DISH_RETURN: "Waiting to return dishes",
+            StudentState.RETURNING_DISHES: "Returning dishes",
+            StudentState.WALKING_TO_EXIT: "Leaving",
+            StudentState.EXITED: "Left the venue",
+        }
+        return descriptions.get(self.state, str(self.state.value))
 
 
 # ============================================================================
@@ -596,7 +623,6 @@ class Pathfinder:
                     if 0 <= gx < self.cols and 0 <= gy < self.rows:
                         self.obstacles.add((gx, gy))
 
-        # Tables as obstacles
         for table in tables:
             rect = table.get_rect()
             for gx in range(rect.left // self.grid_size - 1, (rect.right // self.grid_size) + 2):
@@ -631,7 +657,7 @@ class Pathfinder:
                 if 0 <= nx < self.cols and 0 <= ny < self.rows and (nx, ny) not in self.obstacles:
                     move_cost = 1.4 if abs(dx) + abs(dy) == 2 else 1.0
                     if (nx, ny) in self.high_cost:
-                        move_cost += 2.0
+                        move_cost += 3.0
                     new_cost = cost_so_far[current] + move_cost
                     if (nx, ny) not in cost_so_far or new_cost < cost_so_far[(nx, ny)]:
                         cost_so_far[(nx, ny)] = new_cost
@@ -672,9 +698,13 @@ class StationPropertiesPanel:
         self.visible = False
         self.station = None
         self.scroll_y = 0
+        self.max_scroll = 0
         self.font = None
         self.small_font = None
         self.elements = {}
+        self.food_scroll_y = 0
+        self.food_scroll_max = 0
+        self.food_area_rect = None
 
     def init_fonts(self, font, small_font):
         self.font = font
@@ -684,6 +714,7 @@ class StationPropertiesPanel:
         self.station = station
         self.visible = True
         self.scroll_y = 0
+        self.food_scroll_y = 0
         self._create_elements()
 
     def hide(self):
@@ -700,7 +731,7 @@ class StationPropertiesPanel:
             "name": TextInput(x, y, w, self.station.name, "Station Name"),
             "popularity": Slider(x, y + 50, w, 0, 1, self.station.popularity, "Popularity", "{:.0%}"),
             "service_time": Slider(x, y + 95, w, 1, 20, self.station.service_time, "Service Time (sec)"),
-            "capacity": Slider(x, y + 140, w, 1, 10, self.station.capacity, "Capacity", "{:.0f}"),
+            "capacity": Slider(x, y + 140, w, 1, 6, self.station.capacity, "Serve at once", "{:.0f}"),
         }
 
         # Queue direction buttons
@@ -715,7 +746,7 @@ class StationPropertiesPanel:
         y_flow = y + 210
         self.elements["flow_through"] = Checkbox(x, y_flow, "Flow-Through Zone", self.station.is_flow_through)
 
-        # Flow direction (if flow-through)
+        # Flow direction
         y_flow_dir = y + 235
         self.elements["flow_entry_label"] = ("label", "Entry Side:", x, y_flow_dir)
         btn_w2 = (w - 9) // 4
@@ -731,18 +762,22 @@ class StationPropertiesPanel:
         self.elements["fx_top"] = Button(x + (btn_w2 + 3) * 2, y_flow_exit + 18, btn_w2, 22, "Top")
         self.elements["fx_bottom"] = Button(x + (btn_w2 + 3) * 3, y_flow_exit + 18, btn_w2, 22, "Btm")
 
-        # Food categories
+        # Food categories with scroll area
         y_cat = y_flow_exit + 55
         self.elements["cat_label"] = ("label", "Food Categories:", x, y_cat)
-        y_cat += 18
-        self.elements["food_checkboxes"] = []
-        for cat_id, cat_name, cat_color in FOOD_CATEGORIES:
-            cb = Checkbox(x, y_cat, cat_name, cat_id in self.station.food_categories, cat_color)
-            cb.category_id = cat_id
-            self.elements["food_checkboxes"].append(cb)
-            y_cat += 22
 
-        self.elements["close"] = Button(x, y_cat + 10, w, 28, "Close")
+        # Scrollable food area
+        self.food_area_rect = pygame.Rect(x, y_cat + 18, w, 200)
+        self.food_scroll_max = max(0, len(FOOD_CATEGORIES) * 22 - 200)
+
+        self.elements["food_checkboxes"] = []
+        for i, (cat_id, cat_name, cat_color) in enumerate(FOOD_CATEGORIES):
+            cb = Checkbox(x + 5, y_cat + 18 + i * 22, cat_name, cat_id in self.station.food_categories, cat_color)
+            cb.category_id = cat_id
+            cb.base_y = y_cat + 18 + i * 22
+            self.elements["food_checkboxes"].append(cb)
+
+        self.elements["close"] = Button(x, y_cat + 230, w, 28, "Close")
 
     def handle_event(self, event) -> bool:
         if not self.visible or not self.station:
@@ -751,11 +786,15 @@ class StationPropertiesPanel:
         if event.type == pygame.MOUSEBUTTONDOWN and not self.rect.collidepoint(event.pos):
             return False
 
-        # Scroll
-        if event.type == pygame.MOUSEWHEEL and self.rect.collidepoint(pygame.mouse.get_pos()):
-            self.scroll_y = max(0, min(400, self.scroll_y - event.y * 20))
-            self._create_elements()
-            return True
+        # Scroll food categories
+        if event.type == pygame.MOUSEWHEEL:
+            mouse_pos = pygame.mouse.get_pos()
+            if self.food_area_rect and self.food_area_rect.collidepoint(mouse_pos):
+                self.food_scroll_y = max(0, min(self.food_scroll_max, self.food_scroll_y - event.y * 25))
+                # Update checkbox positions
+                for cb in self.elements.get("food_checkboxes", []):
+                    cb.rect.y = cb.base_y - self.food_scroll_y
+                return True
 
         e = self.elements
         if isinstance(e.get("name"), TextInput) and e["name"].handle_event(event):
@@ -771,18 +810,15 @@ class StationPropertiesPanel:
             self.station.capacity = int(e["capacity"].value)
             return True
 
-        # Queue direction
         for key, direction in [("q_up", "up"), ("q_down", "down"), ("q_left", "left"), ("q_right", "right")]:
             if isinstance(e.get(key), Button) and e[key].handle_event(event):
                 self.station.queue_direction = direction
                 return True
 
-        # Flow-through
         if isinstance(e.get("flow_through"), Checkbox) and e["flow_through"].handle_event(event):
             self.station.is_flow_through = e["flow_through"].checked
             return True
 
-        # Flow entry/exit
         for key, side in [("fe_left", "left"), ("fe_right", "right"), ("fe_top", "top"), ("fe_bottom", "bottom")]:
             if isinstance(e.get(key), Button) and e[key].handle_event(event):
                 self.station.flow_entry_side = side
@@ -792,14 +828,15 @@ class StationPropertiesPanel:
                 self.station.flow_exit_side = side
                 return True
 
-        # Food checkboxes
+        # Food checkboxes - only handle if in visible area
         for cb in e.get("food_checkboxes", []):
-            if cb.handle_event(event):
-                if cb.checked:
-                    self.station.food_categories.add(cb.category_id)
-                else:
-                    self.station.food_categories.discard(cb.category_id)
-                return True
+            if self.food_area_rect and self.food_area_rect.colliderect(cb.rect):
+                if cb.handle_event(event):
+                    if cb.checked:
+                        self.station.food_categories.add(cb.category_id)
+                    else:
+                        self.station.food_categories.discard(cb.category_id)
+                    return True
 
         if isinstance(e.get("close"), Button) and e["close"].handle_event(event):
             self.hide()
@@ -817,6 +854,8 @@ class StationPropertiesPanel:
 
         e = self.elements
         for key, val in e.items():
+            if key == "food_checkboxes":
+                continue
             if isinstance(val, tuple) and val[0] == "label":
                 screen.blit(self.small_font.render(val[1], True, COLORS["text"]), (val[2], val[3]))
             elif isinstance(val, (Slider, Checkbox, TextInput, Button)):
@@ -828,8 +867,22 @@ class StationPropertiesPanel:
                     val.color = COLORS["button_active"] if self.station.flow_exit_side == key[3:] else COLORS["button"]
                 val.draw(screen, self.small_font)
 
-        for cb in e.get("food_checkboxes", []):
-            cb.draw(screen, self.small_font)
+        # Draw scrollable food area with clipping
+        if self.food_area_rect:
+            pygame.draw.rect(screen, COLORS["input_bg"], self.food_area_rect)
+            # Create clip rect
+            old_clip = screen.get_clip()
+            screen.set_clip(self.food_area_rect)
+            for cb in e.get("food_checkboxes", []):
+                cb.draw(screen, self.small_font)
+            screen.set_clip(old_clip)
+
+            # Draw scroll indicator
+            if self.food_scroll_max > 0:
+                scroll_height = max(20, 200 * 200 // (200 + self.food_scroll_max))
+                scroll_y = self.food_area_rect.y + (self.food_scroll_y / self.food_scroll_max) * (200 - scroll_height)
+                pygame.draw.rect(screen, COLORS["slider_fill"],
+                               (self.food_area_rect.right - 8, scroll_y, 6, scroll_height), border_radius=3)
 
 
 class TablePropertiesPanel:
@@ -946,7 +999,7 @@ class DishReturnPropertiesPanel:
 
         btn_w = (w - 9) // 4
         self.elements = {
-            "capacity": Slider(x, y, w, 1, 6, self.dish_return.capacity, "Capacity", "{:.0f}"),
+            "capacity": Slider(x, y, w, 1, 4, self.dish_return.capacity, "Capacity", "{:.0f}"),
             "dir_label": ("label", "Queue Direction:", x, y + 45),
             "q_up": Button(x, y + 63, btn_w, 24, "Up"),
             "q_down": Button(x + btn_w + 3, y + 63, btn_w, 24, "Down"),
@@ -994,6 +1047,78 @@ class DishReturnPropertiesPanel:
                 val.draw(screen, self.small_font)
 
 
+class StudentInfoPanel:
+    def __init__(self, x, y, width, height):
+        self.rect = pygame.Rect(x, y, width, height)
+        self.visible = False
+        self.student = None
+        self.font = None
+        self.small_font = None
+
+    def init_fonts(self, font, small_font):
+        self.font = font
+        self.small_font = small_font
+
+    def show(self, student):
+        self.student = student
+        self.visible = True
+
+    def hide(self):
+        self.visible = False
+        self.student = None
+
+    def draw(self, screen):
+        if not self.visible or not self.student:
+            return
+
+        pygame.draw.rect(screen, COLORS["panel_bg"], self.rect)
+        pygame.draw.rect(screen, COLORS["selected"], self.rect, 2)
+
+        s = self.student
+        y = self.rect.y + 12
+        x = self.rect.x + 12
+
+        screen.blit(self.font.render(f"Student #{s.id}", True, COLORS["text"]), (x, y))
+        y += 25
+
+        # Diet with color
+        diet_colors = {
+            DietType.OMNIVORE: COLORS["student_omnivore"],
+            DietType.VEGETARIAN: COLORS["student_vegetarian"],
+            DietType.VEGAN: COLORS["student_vegan"],
+            DietType.ALLERGEN_SENSITIVE: COLORS["student_allergen"],
+            DietType.HALAL: COLORS["student_halal"],
+        }
+        pygame.draw.circle(screen, diet_colors.get(s.diet, COLORS["text"]), (x + 8, y + 7), 6)
+        screen.blit(self.small_font.render(f"Diet: {s.diet.value.replace('_', ' ').title()}", True, COLORS["text"]), (x + 20, y))
+        y += 20
+
+        # Current state
+        screen.blit(self.small_font.render(f"Status: {s.get_state_description()}", True, COLORS["text"]), (x, y))
+        y += 20
+
+        # Has food?
+        food_status = "Has dessert" if s.has_dessert else ("Has food" if s.has_food else "No food yet")
+        screen.blit(self.small_font.render(f"Food: {food_status}", True, COLORS["text"]), (x, y))
+        y += 20
+
+        # Time stats
+        screen.blit(self.small_font.render(f"Time in system: {s.time_in_system // 60}s", True, COLORS["text"]), (x, y))
+        y += 18
+        screen.blit(self.small_font.render(f"Wait time: {s.wait_time // 60}s", True, COLORS["text"]), (x, y))
+        y += 25
+
+        # Stations visited
+        screen.blit(self.small_font.render("Stations visited:", True, COLORS["text"]), (x, y))
+        y += 18
+        if s.stations_visited:
+            for station_name in s.stations_visited[-5:]:  # Last 5
+                screen.blit(self.small_font.render(f"  - {station_name}", True, COLORS["text_muted"]), (x, y))
+                y += 16
+        else:
+            screen.blit(self.small_font.render("  (none yet)", True, COLORS["text_muted"]), (x, y))
+
+
 # ============================================================================
 # MAIN SIMULATION
 # ============================================================================
@@ -1002,7 +1127,7 @@ class DiningHallSimulation:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Dining Hall Flow Simulator v2.2")
+        pygame.display.set_caption("Dining Hall Flow Simulator v2.3")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 24)
         self.small_font = pygame.font.Font(None, 18)
@@ -1042,9 +1167,12 @@ class DiningHallSimulation:
         self.table_panel.init_fonts(self.font, self.small_font)
         self.dish_panel = DishReturnPropertiesPanel(WINDOW_WIDTH - PANEL_WIDTH, 0, PANEL_WIDTH, WINDOW_HEIGHT)
         self.dish_panel.init_fonts(self.font, self.small_font)
+        self.student_panel = StudentInfoPanel(10, 140, 220, 220)
+        self.student_panel.init_fonts(self.font, self.small_font)
 
         self.selected_item = None
         self.selected_type = None
+        self.selected_student = None
 
         self.load_layout()
 
@@ -1093,7 +1221,7 @@ class DiningHallSimulation:
                     name=s["name"], x=s["x"], y=s["y"], width=s["width"], height=s["height"],
                     color=tuple(s["color"]), food_categories=set(s.get("food_categories", ["pizza"])),
                     popularity=s.get("popularity", 0.5), service_time=s.get("service_time", 6),
-                    capacity=s.get("capacity", 3), queue_direction=s.get("queue_direction", "down"),
+                    capacity=s.get("capacity", 1), queue_direction=s.get("queue_direction", "down"),
                     is_flow_through=s.get("is_flow_through", False),
                     flow_entry_side=s.get("flow_entry_side", "left"),
                     flow_exit_side=s.get("flow_exit_side", "right")
@@ -1108,7 +1236,7 @@ class DiningHallSimulation:
                 self.exits.append(Exit(x=e["x"], y=e["y"]))
             for d in data.get("dish_returns", []):
                 self.dish_returns.append(DishReturn(x=d["x"], y=d["y"], width=d.get("width", 60),
-                    height=d.get("height", 40), capacity=d.get("capacity", 2),
+                    height=d.get("height", 40), capacity=d.get("capacity", 1),
                     queue_direction=d.get("queue_direction", "down")))
             self.update_pathfinding()
         except Exception as e:
@@ -1159,10 +1287,16 @@ class DiningHallSimulation:
         compatible = [s for s in self.stations if s.can_serve_diet(student.diet) and not s.is_dessert_station()]
         if not compatible:
             return None
-        scored = [(s.popularity * 100 - (len(s.queue) + len(s.being_served)) * 12 + random.randint(-15, 15), s)
+        scored = [(s.popularity * 100 - (len(s.queue) + len(s.being_served)) * 15 + random.randint(-15, 15), s)
                   for s in compatible]
         scored.sort(reverse=True, key=lambda x: x[0])
         return scored[0][1] if scored else None
+
+    def choose_dessert_station(self, student):
+        desserts = [s for s in self.stations if s.is_dessert_station()]
+        if not desserts:
+            return None
+        return random.choice(desserts)
 
     def find_table(self):
         available = [t for t in self.tables if t.has_space]
@@ -1178,91 +1312,176 @@ class DiningHallSimulation:
             return None
         return min(self.exits, key=lambda e: math.hypot(e.x - pos[0], e.y - pos[1]))
 
-    def apply_forces(self, student):
-        # Separation from other students
+    def get_student_at(self, pos) -> Optional[Student]:
+        for s in self.students:
+            if s.state != StudentState.EXITED:
+                if math.hypot(s.x - pos[0], s.y - pos[1]) < STUDENT_RADIUS + 5:
+                    return s
+        return None
+
+    def apply_separation(self, student):
+        """Apply separation forces to prevent overlapping"""
         for other in self.students:
-            if other.id == student.id or other.state in [StudentState.EXITED, StudentState.EATING]:
+            if other.id == student.id or other.state == StudentState.EXITED:
                 continue
-            dx, dy = student.x - other.x, student.y - other.y
+            # Skip separation for eating students at their seat
+            if other.state == StudentState.EATING:
+                continue
+
+            dx = student.x - other.x
+            dy = student.y - other.y
             dist = math.hypot(dx, dy)
+
             if 0.1 < dist < SEPARATION_RADIUS:
-                force = (SEPARATION_RADIUS - dist) / SEPARATION_RADIUS
-                student.vx += (dx / dist) * force * SEPARATION_FORCE
-                student.vy += (dy / dist) * force * SEPARATION_FORCE
+                # Stronger separation when very close
+                force = ((SEPARATION_RADIUS - dist) / SEPARATION_RADIUS) ** 1.5
+                if dist > 0:
+                    student.vx += (dx / dist) * force * SEPARATION_FORCE
+                    student.vy += (dy / dist) * force * SEPARATION_FORCE
 
-        # Wall avoidance
+    def apply_wall_avoidance(self, student):
+        """Push students away from walls"""
         for wall in self.walls:
-            rect = wall.get_expanded_rect(WALL_AVOIDANCE_RADIUS)
-            if rect.collidepoint(student.x, student.y):
-                wr = wall.get_rect()
-                cx = max(wr.left, min(student.x, wr.right))
-                cy = max(wr.top, min(student.y, wr.bottom))
-                dx, dy = student.x - cx, student.y - cy
-                dist = math.hypot(dx, dy)
-                if 0 < dist < WALL_AVOIDANCE_RADIUS:
-                    force = (WALL_AVOIDANCE_RADIUS - dist) / WALL_AVOIDANCE_RADIUS
-                    student.vx += (dx / dist) * force * WALL_AVOIDANCE_FORCE
-                    student.vy += (dy / dist) * force * WALL_AVOIDANCE_FORCE
+            rect = wall.get_rect()
+            # Find closest point on wall
+            cx = max(rect.left, min(student.x, rect.right))
+            cy = max(rect.top, min(student.y, rect.bottom))
 
-        # Table avoidance
+            dx = student.x - cx
+            dy = student.y - cy
+            dist = math.hypot(dx, dy)
+
+            if 0 < dist < WALL_AVOIDANCE_RADIUS:
+                force = ((WALL_AVOIDANCE_RADIUS - dist) / WALL_AVOIDANCE_RADIUS) ** 2
+                student.vx += (dx / dist) * force * WALL_AVOIDANCE_FORCE
+                student.vy += (dy / dist) * force * WALL_AVOIDANCE_FORCE
+
+    def apply_table_avoidance(self, student):
+        """Push students away from tables"""
         for table in self.tables:
-            dx, dy = student.x - table.x, student.y - table.y
+            # Skip if student is seated at this table
+            if student.target_table == table and student.state == StudentState.EATING:
+                continue
+
+            dx = student.x - table.x
+            dy = student.y - table.y
             dist = math.hypot(dx, dy)
             avoid_dist = table.radius + TABLE_AVOIDANCE_RADIUS
-            if 0 < dist < avoid_dist:
-                force = (avoid_dist - dist) / avoid_dist
-                student.vx += (dx / dist) * force * 0.8
-                student.vy += (dy / dist) * force * 0.8
 
-    def move_toward(self, student, target):
+            if 0 < dist < avoid_dist:
+                force = ((avoid_dist - dist) / avoid_dist) ** 2
+                student.vx += (dx / dist) * force * 1.0
+                student.vy += (dy / dist) * force * 1.0
+
+    def move_student(self, student, target) -> bool:
+        """Move student toward target, returns True if reached"""
+        # Reset velocity
+        student.vx = 0
+        student.vy = 0
+
+        # Follow path if exists
         if student.path:
             next_pt = student.path[0]
-            dx, dy = next_pt[0] - student.x, next_pt[1] - student.y
+            dx = next_pt[0] - student.x
+            dy = next_pt[1] - student.y
             dist = math.hypot(dx, dy)
+
             if dist < student.speed * self.speed * 2.5:
                 student.path.pop(0)
                 if not student.path:
+                    # Snap to target
                     student.x, student.y = target
                     return True
             else:
+                # Move toward next path point
                 student.vx = (dx / dist) * student.speed
                 student.vy = (dy / dist) * student.speed
         else:
-            dx, dy = target[0] - student.x, target[1] - student.y
+            # Direct movement
+            dx = target[0] - student.x
+            dy = target[1] - student.y
             dist = math.hypot(dx, dy)
+
             if dist < student.speed * self.speed * 2:
                 student.x, student.y = target
                 return True
+
             student.vx = (dx / dist) * student.speed
             student.vy = (dy / dist) * student.speed
 
-        self.apply_forces(student)
-        new_x, new_y = student.x + student.vx * self.speed, student.y + student.vy * self.speed
+        # Apply avoidance forces
+        self.apply_separation(student)
+        self.apply_wall_avoidance(student)
+        self.apply_table_avoidance(student)
 
-        # Check collisions
+        # Calculate new position
+        new_x = student.x + student.vx * self.speed
+        new_y = student.y + student.vy * self.speed
+
+        # Check wall collisions
         blocked = False
         for wall in self.walls:
             if wall.get_rect().inflate(STUDENT_RADIUS * 2, STUDENT_RADIUS * 2).collidepoint(new_x, new_y):
                 blocked = True
                 break
+
+        # Check table collisions
         if not blocked:
             for table in self.tables:
+                if student.target_table == table and student.state in [StudentState.EATING, StudentState.WALKING_TO_TABLE]:
+                    continue
                 if math.hypot(new_x - table.x, new_y - table.y) < table.radius + STUDENT_RADIUS:
                     blocked = True
                     break
 
         if not blocked:
-            student.x, student.y = new_x, new_y
+            student.x = new_x
+            student.y = new_y
             student.stuck_timer = 0
         else:
             student.stuck_timer += 1
-            if student.stuck_timer > 60 and student.target:
-                student.path = self.pathfinder.find_path(student.pos, student.target)
+            # Recalculate path if stuck
+            if student.stuck_timer > 45 and target:
+                student.path = self.pathfinder.find_path(student.pos, target)
                 student.stuck_timer = 0
 
+        # Keep in bounds
         student.x = max(STUDENT_RADIUS, min(self.play_area.width - STUDENT_RADIUS, student.x))
         student.y = max(STUDENT_RADIUS, min(WINDOW_HEIGHT - STUDENT_RADIUS, student.y))
+
         return False
+
+    def update_station_queues(self):
+        """Update queue positions for all stations"""
+        for station in self.stations:
+            if station.is_flow_through:
+                continue
+
+            # Assign queue positions to waiting students
+            for i, student in enumerate(station.queue):
+                student.queue_position = i + len(station.being_served)
+
+            # Move front of queue to service if capacity allows
+            while station.queue and len(station.being_served) < station.capacity:
+                student = station.queue.pop(0)
+                station.being_served.append(student)
+                station.service_timers[student.id] = station.service_time * SERVICE_TIME_MULTIPLIER
+                student.state = StudentState.BEING_SERVED
+                student.queue_position = 0
+
+    def update_dish_return_queues(self):
+        """Update queue positions for dish returns"""
+        for dr in self.dish_returns:
+            # Assign queue positions
+            for i, student in enumerate(dr.queue):
+                student.queue_position = i + len(dr.being_served)
+
+            # Move front to service
+            while dr.queue and len(dr.being_served) < dr.capacity:
+                student = dr.queue.pop(0)
+                dr.being_served.append(student)
+                student.eat_timer = DISH_RETURN_TIME
+                student.state = StudentState.RETURNING_DISHES
 
     def update_student(self, student):
         student.time_in_system += 1
@@ -1274,7 +1493,9 @@ class DiningHallSimulation:
                 if station.is_flow_through:
                     student.target = station.get_flow_entry_point()
                 else:
-                    student.target = station.get_queue_positions(len(station.queue) + 1)[-1]
+                    # Join end of queue
+                    queue_pos = len(station.queue) + len(station.being_served)
+                    student.target = station.get_queue_position(queue_pos)
                 student.path = self.pathfinder.find_path(student.pos, student.target)
                 student.state = StudentState.WALKING_TO_STATION
             elif self.exits:
@@ -1284,31 +1505,36 @@ class DiningHallSimulation:
                 student.state = StudentState.WALKING_TO_EXIT
 
         elif student.state == StudentState.WALKING_TO_STATION:
-            if self.move_toward(student, student.target):
-                station = student.target_station
-                if station.is_flow_through:
+            station = student.target_station
+            if station.is_flow_through:
+                if self.move_student(student, student.target):
                     station.flow_positions.append(student)
                     student.flow_progress = 0
                     student.state = StudentState.IN_FLOW_ZONE
-                else:
+            else:
+                # Update target to current queue end position
+                queue_pos = len(station.queue) + len(station.being_served)
+                student.target = station.get_queue_position(queue_pos)
+
+                if self.move_student(student, student.target):
                     station.queue.append(student)
                     student.state = StudentState.QUEUING
+                    student.stations_visited.append(station.name)
 
         elif student.state == StudentState.IN_FLOW_ZONE:
             student.wait_time += 1
             station = student.target_station
             flow_path = station.get_flow_path(8)
 
-            # Progress through flow zone based on service time
             progress_rate = 1.0 / (station.service_time * SERVICE_TIME_MULTIPLIER / len(flow_path))
             student.flow_progress += progress_rate * self.speed
 
             if student.flow_progress >= len(flow_path) - 1:
-                # Done with flow zone
                 if student in station.flow_positions:
                     station.flow_positions.remove(student)
                 student.has_food = True
                 student.meals_eaten += 1
+                student.stations_visited.append(station.name)
                 table = self.find_table()
                 if table:
                     student.target_table = table
@@ -1319,31 +1545,23 @@ class DiningHallSimulation:
                     student.path = self.pathfinder.find_path(student.pos, student.target)
                     student.state = StudentState.WALKING_TO_TABLE
             else:
-                # Move along flow path
                 idx = min(int(student.flow_progress), len(flow_path) - 1)
-                self.move_toward(student, flow_path[idx])
+                self.move_student(student, flow_path[idx])
 
         elif student.state == StudentState.QUEUING:
             student.wait_time += 1
             station = student.target_station
             if student in station.queue:
-                idx = station.queue.index(student)
-                positions = station.get_queue_positions(len(station.queue))
-                if idx < len(positions):
-                    self.move_toward(student, positions[idx])
-                if idx < station.capacity and len(station.being_served) < station.capacity:
-                    station.queue.remove(student)
-                    station.being_served.append(student)
-                    station.service_timers[student.id] = station.service_time * SERVICE_TIME_MULTIPLIER
-                    student.state = StudentState.BEING_SERVED
+                idx = station.queue.index(student) + len(station.being_served)
+                target_pos = station.get_queue_position(idx)
+                self.move_student(student, target_pos)
 
         elif student.state == StudentState.BEING_SERVED:
             station = student.target_station
-            if student in station.being_served:
-                idx = station.being_served.index(student)
-                positions = station.service_positions
-                if idx < len(positions):
-                    self.move_toward(student, positions[idx])
+            # Move to service point
+            service_pt = station.get_service_point()
+            self.move_student(student, service_pt)
+
             if student.id in station.service_timers:
                 station.service_timers[student.id] -= self.speed
                 if station.service_timers[student.id] <= 0:
@@ -1352,6 +1570,7 @@ class DiningHallSimulation:
                     del station.service_timers[student.id]
                     student.has_food = True
                     student.meals_eaten += 1
+
                     table = self.find_table()
                     if table:
                         student.target_table = table
@@ -1363,65 +1582,86 @@ class DiningHallSimulation:
                         student.state = StudentState.WALKING_TO_TABLE
 
         elif student.state == StudentState.WALKING_TO_TABLE:
-            if self.move_toward(student, student.target):
+            if self.move_student(student, student.target):
                 student.eat_timer = random.randint(EAT_TIME_MIN, EAT_TIME_MAX)
                 student.state = StudentState.EATING
 
         elif student.state == StudentState.EATING:
             student.eat_timer -= self.speed
             if student.seat_position:
-                self.move_toward(student, student.seat_position)
+                self.move_student(student, student.seat_position)
+
             if student.eat_timer <= 0:
                 student.has_food = False
                 if student.target_table and student in student.target_table.occupied_by:
                     student.target_table.occupied_by.remove(student)
-                # Go to dish return
-                dr = self.find_dish_return(student.pos)
-                if dr:
-                    student.target = dr.get_queue_positions(len(dr.queue) + 1)[-1]
-                    student.path = self.pathfinder.find_path(student.pos, student.target)
-                    student.state = StudentState.WALKING_TO_DISH_RETURN
-                else:
+                student.target_table = None
+
+                # Decide what to do next
+                r = random.random()
+                if r < DESSERT_CHANCE and not student.has_dessert:
+                    # Get dessert
+                    dessert = self.choose_dessert_station(student)
+                    if dessert:
+                        student.target_station = dessert
+                        queue_pos = len(dessert.queue) + len(dessert.being_served)
+                        student.target = dessert.get_queue_position(queue_pos)
+                        student.path = self.pathfinder.find_path(student.pos, student.target)
+                        student.state = StudentState.WALKING_TO_STATION
+                        student.has_dessert = True
+                        return
+
+                # Go to dish return (unless has dessert - can leave with it)
+                if student.has_dessert:
                     e = self.find_exit(student.pos)
                     if e:
                         student.target = e.center
                         student.path = self.pathfinder.find_path(student.pos, student.target)
                         student.state = StudentState.WALKING_TO_EXIT
+                else:
+                    dr = self.find_dish_return(student.pos)
+                    if dr:
+                        student.target_dish_return = dr
+                        queue_pos = len(dr.queue) + len(dr.being_served)
+                        student.target = dr.get_queue_position(queue_pos)
+                        student.path = self.pathfinder.find_path(student.pos, student.target)
+                        student.state = StudentState.WALKING_TO_DISH_RETURN
+                    else:
+                        e = self.find_exit(student.pos)
+                        if e:
+                            student.target = e.center
+                            student.path = self.pathfinder.find_path(student.pos, student.target)
+                            student.state = StudentState.WALKING_TO_EXIT
 
         elif student.state == StudentState.WALKING_TO_DISH_RETURN:
-            if self.move_toward(student, student.target):
-                for dr in self.dish_returns:
-                    if math.hypot(dr.center[0] - student.x, dr.center[1] - student.y) < 50:
-                        dr.queue.append(student)
-                        student.state = StudentState.QUEUING_DISH_RETURN
-                        break
+            dr = student.target_dish_return
+            if dr:
+                # Update target to current queue position
+                queue_pos = len(dr.queue) + len(dr.being_served)
+                student.target = dr.get_queue_position(queue_pos)
+
+                if self.move_student(student, student.target):
+                    dr.queue.append(student)
+                    student.state = StudentState.QUEUING_DISH_RETURN
 
         elif student.state == StudentState.QUEUING_DISH_RETURN:
             student.wait_time += 1
-            for dr in self.dish_returns:
-                if student in dr.queue:
-                    idx = dr.queue.index(student)
-                    positions = dr.get_queue_positions(len(dr.queue))
-                    if idx < len(positions):
-                        self.move_toward(student, positions[idx])
-                    if idx < dr.capacity and len(dr.being_served) < dr.capacity:
-                        dr.queue.remove(student)
-                        dr.being_served.append(student)
-                        student.eat_timer = DISH_RETURN_TIME
-                        student.state = StudentState.RETURNING_DISHES
-                    break
+            dr = student.target_dish_return
+            if dr and student in dr.queue:
+                idx = dr.queue.index(student) + len(dr.being_served)
+                target_pos = dr.get_queue_position(idx)
+                self.move_student(student, target_pos)
 
         elif student.state == StudentState.RETURNING_DISHES:
             student.eat_timer -= self.speed
-            for dr in self.dish_returns:
-                if student in dr.being_served:
-                    self.move_toward(student, dr.center)
-                    break
+            dr = student.target_dish_return
+            if dr:
+                self.move_student(student, dr.center)
+
             if student.eat_timer <= 0:
-                for dr in self.dish_returns:
-                    if student in dr.being_served:
-                        dr.being_served.remove(student)
-                        break
+                if dr and student in dr.being_served:
+                    dr.being_served.remove(student)
+
                 e = self.find_exit(student.pos)
                 if e:
                     student.target = e.center
@@ -1429,7 +1669,7 @@ class DiningHallSimulation:
                     student.state = StudentState.WALKING_TO_EXIT
 
         elif student.state == StudentState.WALKING_TO_EXIT:
-            if self.move_toward(student, student.target):
+            if self.move_student(student, student.target):
                 student.state = StudentState.EXITED
                 self.total_students_served += 1
                 self.total_wait_time += student.wait_time
@@ -1438,13 +1678,24 @@ class DiningHallSimulation:
     def update(self):
         if self.paused or self.editor_mode:
             return
+
         self.frame_count += 1
+
+        # Spawn students
         for entrance in self.entrances:
             if self.frame_count % max(1, int(entrance.spawn_rate / self.speed)) == 0:
                 self.spawn_student(entrance)
+
+        # Update queue positions
+        self.update_station_queues()
+        self.update_dish_return_queues()
+
+        # Update students
         for student in self.students:
             if student.state != StudentState.EXITED:
                 self.update_student(student)
+
+        # Remove old exited students
         exited = [s for s in self.students if s.state == StudentState.EXITED]
         if len(exited) > 50:
             for s in exited[:-50]:
@@ -1481,8 +1732,10 @@ class DiningHallSimulation:
             pygame.draw.rect(self.screen, COLORS["dish_return"], rect)
             pygame.draw.rect(self.screen, (255, 255, 255) if dr == self.selected_item else (200, 200, 200), rect, 2)
             self.screen.blit(self.small_font.render("DISHES", True, COLORS["text_dark"]), (dr.x + 2, dr.y + dr.height // 2 - 5))
-            if dr.queue:
-                self.screen.blit(self.small_font.render(f"Q:{len(dr.queue)}", True, COLORS["text"]), (dr.x, dr.y + dr.height + 2))
+            total_q = len(dr.queue) + len(dr.being_served)
+            if total_q > 0:
+                q_color = (255, 100, 100) if total_q > 3 else COLORS["text"]
+                self.screen.blit(self.small_font.render(f"Q:{total_q}", True, q_color), (dr.x, dr.y + dr.height + 2))
 
         # Tables
         for table in self.tables:
@@ -1505,7 +1758,6 @@ class DiningHallSimulation:
             pygame.draw.rect(self.screen, station.color, rect)
             pygame.draw.rect(self.screen, COLORS["selected"] if station == self.selected_item else (255, 255, 255), rect, 2 if station != self.selected_item else 3)
 
-            # Flow zone indicator
             if station.is_flow_through:
                 entry = station.get_flow_entry_point()
                 exit_pt = station.get_flow_exit_point()
@@ -1514,7 +1766,7 @@ class DiningHallSimulation:
                 pygame.draw.line(self.screen, (150, 150, 200), entry, exit_pt, 2)
 
             self.screen.blit(self.small_font.render(station.name[:12], True, COLORS["text_dark"]), (station.x + 2, station.y + 2))
-            q_len = len(station.queue) + len(station.flow_positions)
+            q_len = len(station.queue) + len(station.being_served) + len(station.flow_positions)
             if q_len > 0:
                 q_color = (255, 100, 100) if q_len > 5 else COLORS["text"]
                 self.screen.blit(self.small_font.render(f"Q:{q_len}", True, q_color), (station.x, station.y + station.height + 2))
@@ -1522,6 +1774,10 @@ class DiningHallSimulation:
         # Students
         for student in self.students:
             if student.state != StudentState.EXITED:
+                # Highlight selected student
+                if student == self.selected_student:
+                    pygame.draw.circle(self.screen, COLORS["student_selected"], (int(student.x), int(student.y)), STUDENT_RADIUS + 3, 2)
+
                 pygame.draw.circle(self.screen, student.color, (int(student.x), int(student.y)), STUDENT_RADIUS)
                 if student.has_food:
                     pygame.draw.circle(self.screen, COLORS["student_has_food"], (int(student.x), int(student.y)), 2)
@@ -1531,19 +1787,27 @@ class DiningHallSimulation:
         self.station_panel.draw(self.screen)
         self.table_panel.draw(self.screen)
         self.dish_panel.draw(self.screen)
+
+        # Student info panel
+        if self.selected_student and self.paused and not self.editor_mode:
+            self.student_panel.draw(self.screen)
+
         pygame.display.flip()
 
     def draw_ui(self):
         active = len([s for s in self.students if s.state != StudentState.EXITED])
         avg_wait = (self.total_wait_time / max(1, self.total_students_served)) / 60
-        panel = pygame.Rect(5, 5, 195, 120)
+        panel = pygame.Rect(5, 5, 195, 130)
         pygame.draw.rect(self.screen, COLORS["ui_bg"], panel)
         pygame.draw.rect(self.screen, (80, 80, 80), panel, 1)
         stats = [
             "[ EDITOR ]" if self.editor_mode else ("[ PAUSED ]" if self.paused else "[ RUNNING ]"),
             f"Active: {active} | Served: {self.total_students_served}",
             f"Avg Wait: {avg_wait:.1f}s | Speed: {self.speed:.1f}x",
-            "", "SPACE=Run E=Edit R=Reset", "+/- Speed S=Save L=Image"
+            "",
+            "SPACE=Run E=Edit R=Reset",
+            "+/- Speed S=Save L=Image",
+            "Click student when paused" if self.paused and not self.editor_mode else ""
         ]
         y = 8
         for s in stats:
@@ -1662,6 +1926,8 @@ class DiningHallSimulation:
         self.students = []
         self.frame_count = 0
         self.total_students_served = self.total_wait_time = self.total_time_in_system = 0
+        self.selected_student = None
+        self.student_panel.hide()
         for s in self.stations:
             s.queue, s.being_served, s.service_timers, s.flow_positions = [], [], {}, []
         for t in self.tables:
@@ -1678,9 +1944,10 @@ class DiningHallSimulation:
 
     def run(self):
         print("=" * 50)
-        print("DINING HALL FLOW SIMULATOR v2.2")
+        print("DINING HALL FLOW SIMULATOR v2.3")
         print("Press L to load image, 0-6 for tools")
         print("Click items to edit, SPACE to run")
+        print("Click students when paused to see stats")
         print("=" * 50)
 
         while self.running:
@@ -1703,10 +1970,15 @@ class DiningHallSimulation:
                             self.update_pathfinding()
                         else:
                             self.paused = not self.paused
+                            if not self.paused:
+                                self.selected_student = None
+                                self.student_panel.hide()
                     elif event.key == pygame.K_e:
                         self.editor_mode = not self.editor_mode
                         if self.editor_mode:
                             self.paused = True
+                            self.selected_student = None
+                            self.student_panel.hide()
                     elif event.key == pygame.K_s:
                         self.save_layout()
                     elif event.key == pygame.K_l and self.editor_mode:
@@ -1728,9 +2000,20 @@ class DiningHallSimulation:
                         if event.key in tools:
                             self.current_tool = tools[event.key]
 
-                elif event.type == pygame.MOUSEBUTTONDOWN and self.editor_mode:
-                    if event.pos[1] < WINDOW_HEIGHT - 50 and event.pos[0] < self.play_area.width:
-                        self.handle_editor_click(event.pos, event.button)
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    if self.editor_mode:
+                        if event.pos[1] < WINDOW_HEIGHT - 50 and event.pos[0] < self.play_area.width:
+                            self.handle_editor_click(event.pos, event.button)
+                    elif self.paused and event.pos[0] < self.play_area.width:
+                        # Click on student when paused
+                        student = self.get_student_at(event.pos)
+                        if student:
+                            self.selected_student = student
+                            self.student_panel.show(student)
+                        else:
+                            self.selected_student = None
+                            self.student_panel.hide()
+
                 elif event.type == pygame.MOUSEBUTTONUP and self.editor_mode:
                     self.handle_editor_release(event.pos)
 
