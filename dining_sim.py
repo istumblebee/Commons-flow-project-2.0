@@ -1,5 +1,5 @@
 """
-Dining Hall Flow Simulator v2.3
+Dining Hall Flow Simulator v2.4
 ================================
 Agent-based simulation for analyzing dining hall bottlenecks.
 
@@ -7,6 +7,7 @@ Controls:
     SPACE      - Pause/Resume simulation
     E          - Toggle Editor mode
     +/-        - Speed up/slow down simulation
+    [ / ]      - Decrease/increase spawn rate
     R          - Reset simulation
     Q/ESC      - Quit
 
@@ -49,14 +50,17 @@ PANEL_WIDTH = 280
 GRID_SIZE = 8
 
 STUDENT_RADIUS = 5
-STUDENT_SPAWN_RATE = 80
+STUDENT_SPAWN_RATE_BASE = 120  # Base frames between spawns (higher = slower)
+STUDENT_SPAWN_RATE_MIN = 10   # Minimum frames (fastest spawn)
+STUDENT_SPAWN_RATE_MAX = 300  # Maximum frames (slowest spawn)
 STUDENT_SPEED = 1.8
-SEPARATION_RADIUS = 16
-SEPARATION_FORCE = 1.2
-WALL_AVOIDANCE_RADIUS = 18
-WALL_AVOIDANCE_FORCE = 1.5
-TABLE_AVOIDANCE_RADIUS = 14
-QUEUE_SPACING = 20
+SEPARATION_RADIUS = 18
+SEPARATION_FORCE = 1.5
+WALL_AVOIDANCE_RADIUS = 20
+WALL_AVOIDANCE_FORCE = 1.8
+TABLE_AVOIDANCE_RADIUS = 16
+QUEUE_SPACING = 22
+APPROACH_SPREAD = 30  # How much to spread out approaching students
 
 DIET_DISTRIBUTION = {
     "omnivore": 0.55,
@@ -1127,7 +1131,7 @@ class DiningHallSimulation:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Dining Hall Flow Simulator v2.3")
+        pygame.display.set_caption("Dining Hall Flow Simulator v2.4")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 24)
         self.small_font = pygame.font.Font(None, 18)
@@ -1136,6 +1140,7 @@ class DiningHallSimulation:
         self.running = True
         self.paused = True
         self.speed = 1.0
+        self.spawn_rate = STUDENT_SPAWN_RATE_BASE  # Frames between spawns
         self.frame_count = 0
         self.student_id_counter = 0
 
@@ -1173,6 +1178,8 @@ class DiningHallSimulation:
         self.selected_item = None
         self.selected_type = None
         self.selected_student = None
+        self.spawn_slider_rect = None  # Will be set in draw_ui
+        self.dragging_spawn_slider = False
 
         self.load_layout()
 
@@ -1512,14 +1519,42 @@ class DiningHallSimulation:
                     student.flow_progress = 0
                     student.state = StudentState.IN_FLOW_ZONE
             else:
-                # Update target to current queue end position
+                # Get current queue end position
                 queue_pos = len(station.queue) + len(station.being_served)
-                student.target = station.get_queue_position(queue_pos)
+                queue_target = station.get_queue_position(queue_pos)
+
+                # Count other students also walking to this station
+                others_approaching = [s for s in self.students
+                                     if s.id != student.id
+                                     and s.state == StudentState.WALKING_TO_STATION
+                                     and s.target_station == station]
+
+                # Calculate distance to queue target
+                dist_to_queue = math.hypot(student.x - queue_target[0], student.y - queue_target[1])
+
+                # If far from queue, spread out approach
+                if dist_to_queue > QUEUE_SPACING * 2:
+                    # Find this student's index among approachers (use id for consistency)
+                    approach_idx = sum(1 for s in others_approaching if s.id < student.id)
+
+                    # Add perpendicular offset based on index
+                    dx, dy = 0, 0
+                    if station.queue_direction in ["up", "down"]:
+                        dx = (approach_idx - len(others_approaching) / 2) * APPROACH_SPREAD
+                    else:
+                        dy = (approach_idx - len(others_approaching) / 2) * APPROACH_SPREAD
+
+                    student.target = (queue_target[0] + dx, queue_target[1] + dy)
+                else:
+                    # Close enough - head directly to queue position
+                    student.target = queue_target
 
                 if self.move_student(student, student.target):
-                    station.queue.append(student)
-                    student.state = StudentState.QUEUING
-                    student.stations_visited.append(station.name)
+                    # Only join queue if actually at queue position
+                    if dist_to_queue < QUEUE_SPACING:
+                        station.queue.append(student)
+                        student.state = StudentState.QUEUING
+                        student.stations_visited.append(station.name)
 
         elif student.state == StudentState.IN_FLOW_ZONE:
             student.wait_time += 1
@@ -1682,8 +1717,9 @@ class DiningHallSimulation:
         self.frame_count += 1
 
         # Spawn students
+        spawn_interval = max(1, int(self.spawn_rate / self.speed))
         for entrance in self.entrances:
-            if self.frame_count % max(1, int(entrance.spawn_rate / self.speed)) == 0:
+            if self.frame_count % spawn_interval == 0:
                 self.spawn_student(entrance)
 
         # Update queue positions
@@ -1797,22 +1833,44 @@ class DiningHallSimulation:
     def draw_ui(self):
         active = len([s for s in self.students if s.state != StudentState.EXITED])
         avg_wait = (self.total_wait_time / max(1, self.total_students_served)) / 60
-        panel = pygame.Rect(5, 5, 195, 130)
+
+        # Calculate spawn rate display (higher spawn_rate = slower spawning)
+        # Convert to a 1-10 scale where 10 is fastest
+        spawn_display = int(10 - (self.spawn_rate - STUDENT_SPAWN_RATE_MIN) / (STUDENT_SPAWN_RATE_MAX - STUDENT_SPAWN_RATE_MIN) * 9)
+        spawn_display = max(1, min(10, spawn_display))
+
+        panel = pygame.Rect(5, 5, 210, 155)
         pygame.draw.rect(self.screen, COLORS["ui_bg"], panel)
         pygame.draw.rect(self.screen, (80, 80, 80), panel, 1)
         stats = [
             "[ EDITOR ]" if self.editor_mode else ("[ PAUSED ]" if self.paused else "[ RUNNING ]"),
             f"Active: {active} | Served: {self.total_students_served}",
             f"Avg Wait: {avg_wait:.1f}s | Speed: {self.speed:.1f}x",
-            "",
-            "SPACE=Run E=Edit R=Reset",
-            "+/- Speed S=Save L=Image",
-            "Click student when paused" if self.paused and not self.editor_mode else ""
         ]
         y = 8
         for s in stats:
             self.screen.blit(self.small_font.render(s, True, COLORS["text"]), (10, y))
             y += 15
+
+        # Spawn rate slider
+        y += 5
+        self.screen.blit(self.small_font.render(f"Spawn Rate: {spawn_display}/10", True, COLORS["text"]), (10, y))
+        y += 15
+        slider_rect = pygame.Rect(10, y, 190, 12)
+        pygame.draw.rect(self.screen, COLORS["slider_bg"], slider_rect, border_radius=3)
+        fill_ratio = (STUDENT_SPAWN_RATE_MAX - self.spawn_rate) / (STUDENT_SPAWN_RATE_MAX - STUDENT_SPAWN_RATE_MIN)
+        fill_width = int(fill_ratio * slider_rect.width)
+        pygame.draw.rect(self.screen, COLORS["slider_fill"],
+                        pygame.Rect(slider_rect.x, slider_rect.y, fill_width, slider_rect.height), border_radius=3)
+        self.spawn_slider_rect = slider_rect  # Store for click handling
+
+        y += 18
+        self.screen.blit(self.small_font.render("SPACE=Run E=Edit R=Reset", True, COLORS["text"]), (10, y))
+        y += 15
+        self.screen.blit(self.small_font.render("+/- Speed  [/] Spawn", True, COLORS["text"]), (10, y))
+        y += 15
+        if self.paused and not self.editor_mode:
+            self.screen.blit(self.small_font.render("Click student for stats", True, COLORS["text_muted"]), (10, y))
 
         if self.editor_mode:
             self.draw_toolbar()
@@ -1944,9 +2002,10 @@ class DiningHallSimulation:
 
     def run(self):
         print("=" * 50)
-        print("DINING HALL FLOW SIMULATOR v2.3")
+        print("DINING HALL FLOW SIMULATOR v2.4")
         print("Press L to load image, 0-6 for tools")
         print("Click items to edit, SPACE to run")
+        print("[/] = spawn rate, +/- = speed")
         print("Click students when paused to see stats")
         print("=" * 50)
 
@@ -1991,6 +2050,10 @@ class DiningHallSimulation:
                         self.speed = min(10, self.speed + 0.5)
                     elif event.key == pygame.K_MINUS:
                         self.speed = max(0.5, self.speed - 0.5)
+                    elif event.key == pygame.K_RIGHTBRACKET:  # ] = faster spawn
+                        self.spawn_rate = max(STUDENT_SPAWN_RATE_MIN, self.spawn_rate - 20)
+                    elif event.key == pygame.K_LEFTBRACKET:  # [ = slower spawn
+                        self.spawn_rate = min(STUDENT_SPAWN_RATE_MAX, self.spawn_rate + 20)
                     elif event.key == pygame.K_DELETE and self.editor_mode:
                         self.delete_at(pygame.mouse.get_pos())
                     elif self.editor_mode:
@@ -2001,7 +2064,13 @@ class DiningHallSimulation:
                             self.current_tool = tools[event.key]
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
-                    if self.editor_mode:
+                    # Check spawn rate slider click
+                    if self.spawn_slider_rect and self.spawn_slider_rect.collidepoint(event.pos):
+                        self.dragging_spawn_slider = True
+                        ratio = (event.pos[0] - self.spawn_slider_rect.x) / self.spawn_slider_rect.width
+                        ratio = max(0, min(1, ratio))
+                        self.spawn_rate = int(STUDENT_SPAWN_RATE_MAX - ratio * (STUDENT_SPAWN_RATE_MAX - STUDENT_SPAWN_RATE_MIN))
+                    elif self.editor_mode:
                         if event.pos[1] < WINDOW_HEIGHT - 50 and event.pos[0] < self.play_area.width:
                             self.handle_editor_click(event.pos, event.button)
                     elif self.paused and event.pos[0] < self.play_area.width:
@@ -2014,8 +2083,16 @@ class DiningHallSimulation:
                             self.selected_student = None
                             self.student_panel.hide()
 
-                elif event.type == pygame.MOUSEBUTTONUP and self.editor_mode:
-                    self.handle_editor_release(event.pos)
+                elif event.type == pygame.MOUSEBUTTONUP:
+                    self.dragging_spawn_slider = False
+                    if self.editor_mode:
+                        self.handle_editor_release(event.pos)
+
+                elif event.type == pygame.MOUSEMOTION:
+                    if self.dragging_spawn_slider and self.spawn_slider_rect:
+                        ratio = (event.pos[0] - self.spawn_slider_rect.x) / self.spawn_slider_rect.width
+                        ratio = max(0, min(1, ratio))
+                        self.spawn_rate = int(STUDENT_SPAWN_RATE_MAX - ratio * (STUDENT_SPAWN_RATE_MAX - STUDENT_SPAWN_RATE_MIN))
 
             self.update()
             self.draw()
