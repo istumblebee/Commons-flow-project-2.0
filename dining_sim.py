@@ -32,17 +32,28 @@ Editor Mode:
     C          - Clear all
 """
 
-import pygame
-import json
-import random
-import math
-import heapq
-from pathlib import Path
-from enum import Enum
-from dataclasses import dataclass, field
-from typing import Optional, List, Tuple, Set
-import tkinter as tk
-from tkinter import filedialog
+import sys
+import traceback
+
+try:
+    import pygame
+    import json
+    import random
+    import math
+    import heapq
+    from pathlib import Path
+    from enum import Enum
+    from dataclasses import dataclass, field
+    from typing import Optional, List, Tuple, Set
+    import tkinter as tk
+    from tkinter import filedialog
+except ImportError as e:
+    print("=" * 50)
+    print(f"IMPORT ERROR: {e}")
+    print("Make sure pygame is installed: pip install pygame")
+    print("=" * 50)
+    input("Press Enter to exit...")
+    sys.exit(1)
 
 # ============================================================================
 # CONFIGURATION
@@ -2298,11 +2309,19 @@ class DiningHallSimulation:
 
 if __name__ == "__main__":
     try:
-        DiningHallSimulation().run()
+        sim = DiningHallSimulation()
+        sim.run()
     except Exception as e:
-        import traceback
         print("=" * 50)
         print("CRASH ERROR:")
         print("=" * 50)
         traceback.print_exc()
+        print("=" * 50)
         input("Press Enter to exit...")
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    finally:
+        try:
+            pygame.quit()
+        except:
+            pass
