@@ -1188,7 +1188,7 @@ class DiningHallSimulation:
         self.table_panel.init_fonts(self.font, self.small_font)
         self.dish_panel = DishReturnPropertiesPanel(WINDOW_WIDTH - PANEL_WIDTH, 0, PANEL_WIDTH, WINDOW_HEIGHT)
         self.dish_panel.init_fonts(self.font, self.small_font)
-        self.student_panel = StudentInfoPanel(10, 140, 220, 220)
+        self.student_panel = StudentInfoPanel(10, 170, 220, 240)
         self.student_panel.init_fonts(self.font, self.small_font)
 
         self.selected_item = None
@@ -2297,4 +2297,12 @@ class DiningHallSimulation:
 
 
 if __name__ == "__main__":
-    DiningHallSimulation().run()
+    try:
+        DiningHallSimulation().run()
+    except Exception as e:
+        import traceback
+        print("=" * 50)
+        print("CRASH ERROR:")
+        print("=" * 50)
+        traceback.print_exc()
+        input("Press Enter to exit...")
