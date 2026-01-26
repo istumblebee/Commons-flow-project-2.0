@@ -1,5 +1,5 @@
 """
-Dining Hall Flow Simulator v2.4
+Dining Hall Flow Simulator v2.5
 ================================
 Agent-based simulation for analyzing dining hall bottlenecks.
 
@@ -8,6 +8,8 @@ Controls:
     E          - Toggle Editor mode
     +/-        - Speed up/slow down simulation
     [ / ]      - Decrease/increase spawn rate
+    D          - Toggle debug pathfinding view
+    F          - Force all students to recalculate routes
     R          - Reset simulation
     Q/ESC      - Quit
 
@@ -23,6 +25,8 @@ Editor Mode:
     5          - Exit tool (click to place)
     6          - Dish Return tool (click+drag)
     DELETE     - Delete item under cursor
+    Ctrl+Z     - Undo
+    Ctrl+Y     - Redo
     S          - Save layout
     L          - Load background image
     C          - Clear all
@@ -77,6 +81,9 @@ SERVICE_TIME_MULTIPLIER = 60
 
 SECONDS_CHANCE = 0.18
 DESSERT_CHANCE = 0.22
+GROUP_CHANCE = 0.35  # Chance that a spawn is a group
+GROUP_SIZE_MIN = 2
+GROUP_SIZE_MAX = 4
 
 COLORS = {
     "background": (25, 25, 30),
@@ -108,6 +115,8 @@ COLORS = {
     "checkbox_check": (100, 200, 100),
     "input_bg": (45, 45, 55),
     "selected": (255, 200, 100),
+    "path_line": (100, 200, 255, 150),
+    "group_ring": (255, 150, 255),
 }
 
 # Food categories - expanded
@@ -443,6 +452,7 @@ class Student:
     stuck_timer: int = 0
     flow_progress: int = 0
     stations_visited: list = field(default_factory=list)  # Track visited stations
+    group_id: int = -1  # -1 means solo, otherwise group identifier
 
     @property
     def color(self):
@@ -1106,6 +1116,12 @@ class StudentInfoPanel:
         screen.blit(self.small_font.render(f"Food: {food_status}", True, COLORS["text"]), (x, y))
         y += 20
 
+        # Group info
+        if s.group_id >= 0:
+            pygame.draw.circle(screen, COLORS["group_ring"], (x + 8, y + 7), 6, 2)
+            screen.blit(self.small_font.render(f"Group #{s.group_id}", True, COLORS["text"]), (x + 20, y))
+            y += 20
+
         # Time stats
         screen.blit(self.small_font.render(f"Time in system: {s.time_in_system // 60}s", True, COLORS["text"]), (x, y))
         y += 18
@@ -1131,7 +1147,7 @@ class DiningHallSimulation:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Dining Hall Flow Simulator v2.4")
+        pygame.display.set_caption("Dining Hall Flow Simulator v2.5")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 24)
         self.small_font = pygame.font.Font(None, 18)
@@ -1180,6 +1196,15 @@ class DiningHallSimulation:
         self.selected_student = None
         self.spawn_slider_rect = None  # Will be set in draw_ui
         self.dragging_spawn_slider = False
+
+        # Debug and groups
+        self.debug_paths = False
+        self.group_id_counter = 0
+
+        # Undo/redo system
+        self.undo_history = []
+        self.redo_history = []
+        self.max_undo = 50
 
         self.load_layout()
 
@@ -1246,6 +1271,7 @@ class DiningHallSimulation:
                     height=d.get("height", 40), capacity=d.get("capacity", 1),
                     queue_direction=d.get("queue_direction", "down")))
             self.update_pathfinding()
+            self.save_undo_state()  # Initial state for undo
         except Exception as e:
             print(f"Load error: {e}")
 
@@ -1271,24 +1297,126 @@ class DiningHallSimulation:
             json.dump(data, f, indent=2)
         print("Saved!")
 
+    def save_undo_state(self):
+        """Save current layout state for undo"""
+        state = {
+            "stations": [(s.name, s.x, s.y, s.width, s.height, s.color, list(s.food_categories),
+                         s.popularity, s.service_time, s.capacity, s.queue_direction,
+                         s.is_flow_through, s.flow_entry_side, s.flow_exit_side) for s in self.stations],
+            "tables": [(t.x, t.y, t.seats, t.shape) for t in self.tables],
+            "walls": [(w.x1, w.y1, w.x2, w.y2) for w in self.walls],
+            "entrances": [(e.x, e.y) for e in self.entrances],
+            "exits": [(e.x, e.y) for e in self.exits],
+            "dish_returns": [(d.x, d.y, d.width, d.height, d.capacity, d.queue_direction) for d in self.dish_returns],
+        }
+        self.undo_history.append(state)
+        if len(self.undo_history) > self.max_undo:
+            self.undo_history.pop(0)
+        self.redo_history.clear()
+
+    def restore_state(self, state):
+        """Restore layout from saved state"""
+        self.stations.clear()
+        self.tables.clear()
+        self.walls.clear()
+        self.entrances.clear()
+        self.exits.clear()
+        self.dish_returns.clear()
+
+        for s in state["stations"]:
+            self.stations.append(Station(
+                name=s[0], x=s[1], y=s[2], width=s[3], height=s[4], color=s[5],
+                food_categories=set(s[6]), popularity=s[7], service_time=s[8],
+                capacity=s[9], queue_direction=s[10], is_flow_through=s[11],
+                flow_entry_side=s[12], flow_exit_side=s[13]
+            ))
+        for t in state["tables"]:
+            self.tables.append(Table(x=t[0], y=t[1], seats=t[2], shape=t[3]))
+        for w in state["walls"]:
+            self.walls.append(Wall(x1=w[0], y1=w[1], x2=w[2], y2=w[3]))
+        for e in state["entrances"]:
+            self.entrances.append(Entrance(x=e[0], y=e[1]))
+        for e in state["exits"]:
+            self.exits.append(Exit(x=e[0], y=e[1]))
+        for d in state["dish_returns"]:
+            self.dish_returns.append(DishReturn(x=d[0], y=d[1], width=d[2], height=d[3], capacity=d[4], queue_direction=d[5]))
+
+        self.selected_item = None
+        self.hide_all_panels()
+        self.update_pathfinding()
+
+    def undo(self):
+        """Undo last editor action"""
+        if len(self.undo_history) < 2:
+            return
+        # Save current state to redo
+        current = self.undo_history.pop()
+        self.redo_history.append(current)
+        # Restore previous state
+        self.restore_state(self.undo_history[-1])
+
+    def redo(self):
+        """Redo last undone action"""
+        if not self.redo_history:
+            return
+        state = self.redo_history.pop()
+        self.undo_history.append(state)
+        self.restore_state(state)
+
+    def force_recalculate_paths(self):
+        """Force all students to recalculate their paths"""
+        for student in self.students:
+            if student.state != StudentState.EXITED and student.target:
+                student.path = self.pathfinder.find_path(student.pos, student.target)
+                student.stuck_timer = 0
+
     def update_pathfinding(self):
         self.pathfinder.update_obstacles(self.walls, self.stations, self.tables)
 
     def spawn_student(self, entrance):
+        # Determine if this is a group spawn
+        is_group = random.random() < GROUP_CHANCE
+        group_size = random.randint(GROUP_SIZE_MIN, GROUP_SIZE_MAX) if is_group else 1
+        group_id = self.group_id_counter if is_group else -1
+
+        if is_group:
+            self.group_id_counter += 1
+
+        # Pick a shared diet for group (groups of friends often eat similar)
         r = random.random()
         cumulative = 0
-        diet = DietType.OMNIVORE
+        base_diet = DietType.OMNIVORE
         for name, prob in DIET_DISTRIBUTION.items():
             cumulative += prob
             if r <= cumulative:
-                diet = DietType[name.upper()]
+                base_diet = DietType[name.upper()]
                 break
-        self.students.append(Student(
-            id=self.student_id_counter, x=entrance.x + random.randint(-8, 8),
-            y=entrance.y + random.randint(-8, 8), diet=diet,
-            speed=random.uniform(STUDENT_SPEED * 0.85, STUDENT_SPEED * 1.15)
-        ))
-        self.student_id_counter += 1
+
+        for i in range(group_size):
+            # Group members spawn near each other
+            offset_x = random.randint(-12, 12) + (i % 2) * 10
+            offset_y = random.randint(-12, 12) + (i // 2) * 10
+
+            # Small chance group member has different diet
+            diet = base_diet
+            if is_group and random.random() < 0.15:
+                r = random.random()
+                cumulative = 0
+                for name, prob in DIET_DISTRIBUTION.items():
+                    cumulative += prob
+                    if r <= cumulative:
+                        diet = DietType[name.upper()]
+                        break
+
+            self.students.append(Student(
+                id=self.student_id_counter,
+                x=entrance.x + offset_x,
+                y=entrance.y + offset_y,
+                diet=diet,
+                speed=random.uniform(STUDENT_SPEED * 0.85, STUDENT_SPEED * 1.15),
+                group_id=group_id
+            ))
+            self.student_id_counter += 1
 
     def choose_station(self, student):
         compatible = [s for s in self.stations if s.can_serve_diet(student.diet) and not s.is_dessert_station()]
@@ -1305,9 +1433,36 @@ class DiningHallSimulation:
             return None
         return random.choice(desserts)
 
-    def find_table(self):
+    def find_table(self, student=None):
+        """Find a table, preferring one where group members are already seated"""
+        available = [t for t in self.tables if t.has_space]
+        if not available:
+            return None
+
+        # If student is in a group, try to find where group is seated
+        if student and student.group_id >= 0:
+            for table in available:
+                for occupant in table.occupied_by:
+                    if occupant.group_id == student.group_id:
+                        return table
+
+        return random.choice(available)
+
+    def find_table_for_group(self, group_size: int):
+        """Find a table with enough space for the whole group"""
+        # Prefer tables that can fit the whole group
+        perfect_fit = [t for t in self.tables if t.seats - len(t.occupied_by) >= group_size]
+        if perfect_fit:
+            return random.choice(perfect_fit)
+        # Otherwise any table with space
         available = [t for t in self.tables if t.has_space]
         return random.choice(available) if available else None
+
+    def get_group_members(self, group_id: int) -> List[Student]:
+        """Get all students in a group"""
+        if group_id < 0:
+            return []
+        return [s for s in self.students if s.group_id == group_id and s.state != StudentState.EXITED]
 
     def find_dish_return(self, pos):
         if not self.dish_returns:
@@ -1570,7 +1725,7 @@ class DiningHallSimulation:
                 student.has_food = True
                 student.meals_eaten += 1
                 student.stations_visited.append(station.name)
-                table = self.find_table()
+                table = self.find_table(student)
                 if table:
                     student.target_table = table
                     table.occupied_by.append(student)
@@ -1606,7 +1761,7 @@ class DiningHallSimulation:
                     student.has_food = True
                     student.meals_eaten += 1
 
-                    table = self.find_table()
+                    table = self.find_table(student)
                     if table:
                         student.target_table = table
                         table.occupied_by.append(student)
@@ -1810,6 +1965,19 @@ class DiningHallSimulation:
         # Students
         for student in self.students:
             if student.state != StudentState.EXITED:
+                # Debug: draw path
+                if self.debug_paths and student.path:
+                    points = [(int(student.x), int(student.y))] + [(int(p[0]), int(p[1])) for p in student.path]
+                    if len(points) > 1:
+                        pygame.draw.lines(self.screen, (100, 200, 255), False, points, 1)
+                        # Draw target marker
+                        if student.target:
+                            pygame.draw.circle(self.screen, (255, 100, 100), (int(student.target[0]), int(student.target[1])), 4, 1)
+
+                # Group indicator ring
+                if student.group_id >= 0:
+                    pygame.draw.circle(self.screen, COLORS["group_ring"], (int(student.x), int(student.y)), STUDENT_RADIUS + 2, 1)
+
                 # Highlight selected student
                 if student == self.selected_student:
                     pygame.draw.circle(self.screen, COLORS["student_selected"], (int(student.x), int(student.y)), STUDENT_RADIUS + 3, 2)
@@ -1867,9 +2035,11 @@ class DiningHallSimulation:
         y += 18
         self.screen.blit(self.small_font.render("SPACE=Run E=Edit R=Reset", True, COLORS["text"]), (10, y))
         y += 15
-        self.screen.blit(self.small_font.render("+/- Speed  [/] Spawn", True, COLORS["text"]), (10, y))
+        self.screen.blit(self.small_font.render("D=Debug F=Recalc paths", True, COLORS["text"]), (10, y))
         y += 15
-        if self.paused and not self.editor_mode:
+        if self.debug_paths:
+            self.screen.blit(self.small_font.render("[DEBUG PATHS ON]", True, (100, 200, 255)), (10, y))
+        elif self.paused and not self.editor_mode:
             self.screen.blit(self.small_font.render("Click student for stats", True, COLORS["text_muted"]), (10, y))
 
         if self.editor_mode:
@@ -1929,13 +2099,16 @@ class DiningHallSimulation:
             self.drawing = True
             self.draw_start = pos
         elif self.current_tool == EditorTool.TABLE:
+            self.save_undo_state()
             t = Table(x=pos[0], y=pos[1], seats=4, shape="circle")
             self.tables.append(t)
             self.select_item("table", t)
             self.update_pathfinding()
         elif self.current_tool == EditorTool.ENTRANCE:
+            self.save_undo_state()
             self.entrances.append(Entrance(x=pos[0], y=pos[1]))
         elif self.current_tool == EditorTool.EXIT:
+            self.save_undo_state()
             self.exits.append(Exit(x=pos[0], y=pos[1]))
 
     def handle_editor_release(self, pos):
@@ -1945,15 +2118,18 @@ class DiningHallSimulation:
         w, h = abs(pos[0] - self.draw_start[0]), abs(pos[1] - self.draw_start[1])
 
         if self.current_tool == EditorTool.STATION and w > 20 and h > 20:
+            self.save_undo_state()
             s = Station(name=f"Station {len(self.stations) + 1}", x=x, y=y, width=w, height=h,
                        color=(random.randint(150, 240), random.randint(150, 240), random.randint(100, 200)))
             self.stations.append(s)
             self.select_item("station", s)
             self.update_pathfinding()
         elif self.current_tool == EditorTool.WALL and (w > 5 or h > 5):
+            self.save_undo_state()
             self.walls.append(Wall(x1=self.draw_start[0], y1=self.draw_start[1], x2=pos[0], y2=pos[1]))
             self.update_pathfinding()
         elif self.current_tool == EditorTool.DISH_RETURN and w > 20 and h > 20:
+            self.save_undo_state()
             d = DishReturn(x=x, y=y, width=w, height=h)
             self.dish_returns.append(d)
             self.select_item("dish_return", d)
@@ -1994,6 +2170,7 @@ class DiningHallSimulation:
             d.queue, d.being_served = [], []
 
     def clear_layout(self):
+        self.save_undo_state()
         self.stations, self.tables, self.walls, self.entrances, self.exits, self.dish_returns = [], [], [], [], [], []
         self.selected_item = None
         self.hide_all_panels()
@@ -2002,11 +2179,11 @@ class DiningHallSimulation:
 
     def run(self):
         print("=" * 50)
-        print("DINING HALL FLOW SIMULATOR v2.4")
+        print("DINING HALL FLOW SIMULATOR v2.5")
         print("Press L to load image, 0-6 for tools")
-        print("Click items to edit, SPACE to run")
-        print("[/] = spawn rate, +/- = speed")
-        print("Click students when paused to see stats")
+        print("D=debug paths, F=recalc routes")
+        print("Ctrl+Z=undo, Ctrl+Y=redo")
+        print("SPACE to run, click students for stats")
         print("=" * 50)
 
         while self.running:
@@ -2054,7 +2231,18 @@ class DiningHallSimulation:
                         self.spawn_rate = max(STUDENT_SPAWN_RATE_MIN, self.spawn_rate - 20)
                     elif event.key == pygame.K_LEFTBRACKET:  # [ = slower spawn
                         self.spawn_rate = min(STUDENT_SPAWN_RATE_MAX, self.spawn_rate + 20)
+                    elif event.key == pygame.K_d:  # D = toggle debug paths
+                        self.debug_paths = not self.debug_paths
+                    elif event.key == pygame.K_f:  # F = force recalculate paths
+                        self.force_recalculate_paths()
+                    elif event.key == pygame.K_z and pygame.key.get_mods() & pygame.KMOD_CTRL:
+                        if self.editor_mode:
+                            self.undo()
+                    elif event.key == pygame.K_y and pygame.key.get_mods() & pygame.KMOD_CTRL:
+                        if self.editor_mode:
+                            self.redo()
                     elif event.key == pygame.K_DELETE and self.editor_mode:
+                        self.save_undo_state()
                         self.delete_at(pygame.mouse.get_pos())
                     elif self.editor_mode:
                         tools = {pygame.K_0: EditorTool.SELECT, pygame.K_1: EditorTool.STATION, pygame.K_2: EditorTool.TABLE,
