@@ -420,7 +420,7 @@ class DishReturn:
 class Entrance:
     x: int
     y: int
-    spawn_rate: int = STUDENT_SPAWN_RATE
+    spawn_rate: int = STUDENT_SPAWN_RATE_BASE
 
     @property
     def center(self):
