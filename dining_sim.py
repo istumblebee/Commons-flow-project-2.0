@@ -66,8 +66,8 @@ except ImportError as e:
 # CONFIGURATION
 # ============================================================================
 
-WINDOW_WIDTH = 1500
-WINDOW_HEIGHT = 950
+WINDOW_WIDTH = 1920
+WINDOW_HEIGHT = 1000
 PANEL_WIDTH = 280
 GRID_SIZE = 8
 
@@ -1342,6 +1342,9 @@ class DiningHallSimulation:
         self.small_font = pygame.font.Font(None, 18)
 
         self.play_area = pygame.Rect(0, 0, WINDOW_WIDTH - PANEL_WIDTH, WINDOW_HEIGHT)
+        # World can be larger than play area for big floor plans
+        self.world_width = self.play_area.width
+        self.world_height = WINDOW_HEIGHT
         self.running = True
         self.paused = True
         self.speed = 1.0
@@ -1376,7 +1379,7 @@ class DiningHallSimulation:
         # Toolbar button rectangles (will be set in draw_toolbar)
         self.toolbar_buttons = []
 
-        self.pathfinder = Pathfinder(self.play_area.width, WINDOW_HEIGHT, GRID_SIZE)
+        self.pathfinder = Pathfinder(self.world_width, self.world_height, GRID_SIZE)
         self.background_image = None
         self.background_path = None
 
@@ -1441,9 +1444,19 @@ class DiningHallSimulation:
             root.destroy()
         if path:
             try:
-                self.background_image = pygame.transform.scale(
-                    pygame.image.load(path), (self.play_area.width, self.play_area.height))
+                img = pygame.image.load(path)
+                img_w, img_h = img.get_size()
+                # Expand world size to fit image (keep at least current play area size)
+                self.world_width = max(self.play_area.width, img_w)
+                self.world_height = max(WINDOW_HEIGHT - 50, img_h)  # Leave room for toolbar
+                # Don't scale - keep original size for detail, user can zoom
+                self.background_image = img
                 self.background_path = path
+                # Update pathfinder for new world size
+                self.pathfinder = Pathfinder(self.world_width, self.world_height, GRID_SIZE)
+                self.update_pathfinding()
+                print(f"Loaded image: {img_w}x{img_h} - World size: {self.world_width}x{self.world_height}")
+                print("Use scroll wheel to zoom, middle-drag to pan")
             except Exception as e:
                 print(f"Error: {e}")
 
@@ -1895,9 +1908,9 @@ class DiningHallSimulation:
                 student.path = self.pathfinder.find_path(student.pos, target)
                 student.stuck_timer = 0
 
-        # Keep in bounds
-        student.x = max(STUDENT_RADIUS, min(self.play_area.width - STUDENT_RADIUS, student.x))
-        student.y = max(STUDENT_RADIUS, min(WINDOW_HEIGHT - STUDENT_RADIUS, student.y))
+        # Keep in bounds (use world size, not play area)
+        student.x = max(STUDENT_RADIUS, min(self.world_width - STUDENT_RADIUS, student.x))
+        student.y = max(STUDENT_RADIUS, min(self.world_height - STUDENT_RADIUS, student.y))
 
         return False
 
@@ -1981,9 +1994,9 @@ class DiningHallSimulation:
                     self.apply_wall_avoidance(student)
                     new_x = student.x + student.vx * self.speed
                     new_y = student.y + student.vy * self.speed
-                    # Keep in bounds
-                    new_x = max(STUDENT_RADIUS, min(self.play_area.width - STUDENT_RADIUS, new_x))
-                    new_y = max(STUDENT_RADIUS, min(WINDOW_HEIGHT - STUDENT_RADIUS, new_y))
+                    # Keep in bounds (use world size)
+                    new_x = max(STUDENT_RADIUS, min(self.world_width - STUDENT_RADIUS, new_x))
+                    new_y = max(STUDENT_RADIUS, min(self.world_height - STUDENT_RADIUS, new_y))
                     student.x = new_x
                     student.y = new_y
                 else:
@@ -2281,123 +2294,166 @@ class DiningHallSimulation:
                 self.students.remove(s)
 
     def draw(self):
+        # Clear screen
+        self.screen.fill(COLORS["background"])
+
+        # Create a clipping rect for the play area (exclude panel and toolbar)
+        clip_rect = pygame.Rect(0, 0, self.play_area.width, WINDOW_HEIGHT - 50)
+        self.screen.set_clip(clip_rect)
+
+        # Draw background image with zoom/pan
         if self.background_image:
-            self.screen.blit(self.background_image, (0, 0))
+            # Calculate screen position of world origin
+            bg_screen_x = -self.camera_x * self.zoom
+            bg_screen_y = -self.camera_y * self.zoom
+            # Scale background image
+            scaled_w = int(self.background_image.get_width() * self.zoom)
+            scaled_h = int(self.background_image.get_height() * self.zoom)
+            if scaled_w > 0 and scaled_h > 0:
+                scaled_bg = pygame.transform.scale(self.background_image, (scaled_w, scaled_h))
+                self.screen.blit(scaled_bg, (bg_screen_x, bg_screen_y))
         else:
-            self.screen.fill(COLORS["background"])
+            # Draw grid in editor mode
             if self.editor_mode:
-                for x in range(0, self.play_area.width, 50):
-                    pygame.draw.line(self.screen, COLORS["grid"], (x, 0), (x, WINDOW_HEIGHT))
-                for y in range(0, WINDOW_HEIGHT, 50):
-                    pygame.draw.line(self.screen, COLORS["grid"], (0, y), (self.play_area.width, y))
+                grid_spacing = int(50 * self.zoom)
+                if grid_spacing > 5:
+                    start_x = int(-self.camera_x * self.zoom) % grid_spacing
+                    start_y = int(-self.camera_y * self.zoom) % grid_spacing
+                    for x in range(start_x, self.play_area.width, grid_spacing):
+                        pygame.draw.line(self.screen, COLORS["grid"], (x, 0), (x, WINDOW_HEIGHT - 50))
+                    for y in range(start_y, WINDOW_HEIGHT - 50, grid_spacing):
+                        pygame.draw.line(self.screen, COLORS["grid"], (0, y), (self.play_area.width, y))
+
+        # Helper to transform world coords to screen coords
+        def w2s(pos):
+            return self.world_to_screen(pos)
+
+        def w2s_rect(rect):
+            x, y = w2s((rect.x, rect.y))
+            return pygame.Rect(x, y, rect.width * self.zoom, rect.height * self.zoom)
 
         # Walls
         for wall in self.walls:
-            pygame.draw.rect(self.screen, COLORS["wall"], wall.get_rect())
+            screen_rect = w2s_rect(wall.get_rect())
+            pygame.draw.rect(self.screen, COLORS["wall"], screen_rect)
 
         # Entrances/Exits
+        radius = max(3, int(16 * self.zoom))
         for ent in self.entrances:
-            pygame.draw.circle(self.screen, COLORS["entrance"], ent.center, 16)
-            pygame.draw.circle(self.screen, (255, 255, 255), ent.center, 16, 2)
-            self.screen.blit(self.small_font.render("IN", True, COLORS["text_dark"]), (ent.x - 7, ent.y - 5))
+            sx, sy = w2s(ent.center)
+            pygame.draw.circle(self.screen, COLORS["entrance"], (int(sx), int(sy)), radius)
+            pygame.draw.circle(self.screen, (255, 255, 255), (int(sx), int(sy)), radius, 2)
+            if self.zoom > 0.5:
+                self.screen.blit(self.small_font.render("IN", True, COLORS["text_dark"]), (sx - 7, sy - 5))
         for ext in self.exits:
-            pygame.draw.circle(self.screen, COLORS["exit"], ext.center, 16)
-            pygame.draw.circle(self.screen, (255, 255, 255), ext.center, 16, 2)
-            self.screen.blit(self.small_font.render("OUT", True, COLORS["text_dark"]), (ext.x - 10, ext.y - 5))
+            sx, sy = w2s(ext.center)
+            pygame.draw.circle(self.screen, COLORS["exit"], (int(sx), int(sy)), radius)
+            pygame.draw.circle(self.screen, (255, 255, 255), (int(sx), int(sy)), radius, 2)
+            if self.zoom > 0.5:
+                self.screen.blit(self.small_font.render("OUT", True, COLORS["text_dark"]), (sx - 10, sy - 5))
 
         # Stairs (portals)
+        stair_size = max(6, int(15 * self.zoom))
         for stair in self.stairs:
-            # Only draw stairs on current floor
             if stair.floor == self.current_floor:
-                # Stair color - cyan for up, orange for down
+                sx, sy = w2s((stair.x, stair.y))
                 stair_color = (100, 200, 255) if stair.direction == "up" else (255, 180, 100)
-                pygame.draw.rect(self.screen, stair_color, (stair.x - 15, stair.y - 15, 30, 30))
-                pygame.draw.rect(self.screen, COLORS["selected"] if stair == self.selected_item else (255, 255, 255),
-                               (stair.x - 15, stair.y - 15, 30, 30), 2)
-                # Draw stairs icon (lines)
-                for i in range(3):
-                    line_y = stair.y - 8 + i * 6
-                    pygame.draw.line(self.screen, COLORS["text_dark"], (stair.x - 8, line_y), (stair.x + 8, line_y), 2)
-                # Direction arrow
-                if stair.direction == "up":
-                    pygame.draw.polygon(self.screen, COLORS["text_dark"],
-                                       [(stair.x, stair.y - 12), (stair.x - 5, stair.y - 6), (stair.x + 5, stair.y - 6)])
-                else:
-                    pygame.draw.polygon(self.screen, COLORS["text_dark"],
-                                       [(stair.x, stair.y + 12), (stair.x - 5, stair.y + 6), (stair.x + 5, stair.y + 6)])
-                # Show if linked
-                linked = self.get_linked_stair(stair)
-                link_text = "Linked" if linked else "Unlinked"
-                self.screen.blit(self.small_font.render(link_text, True, COLORS["text"]), (stair.x - 18, stair.y + 18))
+                stair_rect = pygame.Rect(sx - stair_size, sy - stair_size, stair_size * 2, stair_size * 2)
+                pygame.draw.rect(self.screen, stair_color, stair_rect)
+                pygame.draw.rect(self.screen, COLORS["selected"] if stair == self.selected_item else (255, 255, 255), stair_rect, 2)
+                if self.zoom > 0.5:
+                    for i in range(3):
+                        line_y = sy - 8 + i * 6
+                        pygame.draw.line(self.screen, COLORS["text_dark"], (sx - 8, line_y), (sx + 8, line_y), 2)
+                    linked = self.get_linked_stair(stair)
+                    link_text = "Linked" if linked else "Unlinked"
+                    self.screen.blit(self.small_font.render(link_text, True, COLORS["text"]), (sx - 18, sy + stair_size + 3))
 
         # Dish returns
         for dr in self.dish_returns:
-            rect = pygame.Rect(dr.x, dr.y, dr.width, dr.height)
-            pygame.draw.rect(self.screen, COLORS["dish_return"], rect)
-            pygame.draw.rect(self.screen, (255, 255, 255) if dr == self.selected_item else (200, 200, 200), rect, 2)
-            self.screen.blit(self.small_font.render("DISHES", True, COLORS["text_dark"]), (dr.x + 2, dr.y + dr.height // 2 - 5))
-            total_q = len(dr.queue) + len(dr.being_served)
-            if total_q > 0:
-                q_color = (255, 100, 100) if total_q > 3 else COLORS["text"]
-                self.screen.blit(self.small_font.render(f"Q:{total_q}", True, q_color), (dr.x, dr.y + dr.height + 2))
+            screen_rect = w2s_rect(pygame.Rect(dr.x, dr.y, dr.width, dr.height))
+            pygame.draw.rect(self.screen, COLORS["dish_return"], screen_rect)
+            pygame.draw.rect(self.screen, (255, 255, 255) if dr == self.selected_item else (200, 200, 200), screen_rect, 2)
+            if self.zoom > 0.4:
+                sx, sy = w2s((dr.x, dr.y))
+                self.screen.blit(self.small_font.render("DISHES", True, COLORS["text_dark"]), (sx + 2, sy + screen_rect.height // 2 - 5))
+                total_q = len(dr.queue) + len(dr.being_served)
+                if total_q > 0:
+                    q_color = (255, 100, 100) if total_q > 3 else COLORS["text"]
+                    self.screen.blit(self.small_font.render(f"Q:{total_q}", True, q_color), (sx, sy + screen_rect.height + 2))
 
         # Tables
         for table in self.tables:
+            sx, sy = w2s(table.center)
+            scaled_radius = max(3, int(table.radius * self.zoom))
             color = COLORS["table_occupied"] if table.occupied_by else COLORS["table"]
             if table.shape == "circle":
-                pygame.draw.circle(self.screen, color, table.center, table.radius)
+                pygame.draw.circle(self.screen, color, (int(sx), int(sy)), scaled_radius)
                 pygame.draw.circle(self.screen, COLORS["selected"] if table == self.selected_item else (160, 160, 160),
-                                  table.center, table.radius, 2)
+                                  (int(sx), int(sy)), scaled_radius, 2)
             else:
-                r = table.radius
-                rect = pygame.Rect(table.x - r, table.y - r, r * 2, r * 2)
+                rect = pygame.Rect(sx - scaled_radius, sy - scaled_radius, scaled_radius * 2, scaled_radius * 2)
                 pygame.draw.rect(self.screen, color, rect)
                 pygame.draw.rect(self.screen, COLORS["selected"] if table == self.selected_item else (160, 160, 160), rect, 2)
-            self.screen.blit(self.small_font.render(f"{len(table.occupied_by)}/{table.seats}", True, COLORS["text"]),
-                            (table.x - 8, table.y - 5))
+            if self.zoom > 0.5:
+                self.screen.blit(self.small_font.render(f"{len(table.occupied_by)}/{table.seats}", True, COLORS["text"]),
+                                (sx - 8, sy - 5))
 
         # Stations
         for station in self.stations:
-            rect = pygame.Rect(station.x, station.y, station.width, station.height)
-            pygame.draw.rect(self.screen, station.color, rect)
-            pygame.draw.rect(self.screen, COLORS["selected"] if station == self.selected_item else (255, 255, 255), rect, 2 if station != self.selected_item else 3)
+            screen_rect = w2s_rect(pygame.Rect(station.x, station.y, station.width, station.height))
+            pygame.draw.rect(self.screen, station.color, screen_rect)
+            pygame.draw.rect(self.screen, COLORS["selected"] if station == self.selected_item else (255, 255, 255),
+                           screen_rect, 2 if station != self.selected_item else 3)
 
             if station.is_flow_through:
-                entry = station.get_flow_entry_point()
-                exit_pt = station.get_flow_exit_point()
-                pygame.draw.circle(self.screen, (100, 255, 100), entry, 6)
-                pygame.draw.circle(self.screen, (255, 100, 100), exit_pt, 6)
-                pygame.draw.line(self.screen, (150, 150, 200), entry, exit_pt, 2)
+                entry_s = w2s(station.get_flow_entry_point())
+                exit_s = w2s(station.get_flow_exit_point())
+                dot_r = max(2, int(6 * self.zoom))
+                pygame.draw.circle(self.screen, (100, 255, 100), (int(entry_s[0]), int(entry_s[1])), dot_r)
+                pygame.draw.circle(self.screen, (255, 100, 100), (int(exit_s[0]), int(exit_s[1])), dot_r)
+                pygame.draw.line(self.screen, (150, 150, 200), entry_s, exit_s, 2)
 
-            self.screen.blit(self.small_font.render(station.name[:12], True, COLORS["text_dark"]), (station.x + 2, station.y + 2))
-            q_len = len(station.queue) + len(station.being_served) + len(station.flow_positions)
-            if q_len > 0:
-                q_color = (255, 100, 100) if q_len > 5 else COLORS["text"]
-                self.screen.blit(self.small_font.render(f"Q:{q_len}", True, q_color), (station.x, station.y + station.height + 2))
+            if self.zoom > 0.4:
+                sx, sy = w2s((station.x, station.y))
+                self.screen.blit(self.small_font.render(station.name[:12], True, COLORS["text_dark"]), (sx + 2, sy + 2))
+            if self.zoom > 0.4:
+                q_len = len(station.queue) + len(station.being_served) + len(station.flow_positions)
+                if q_len > 0:
+                    q_color = (255, 100, 100) if q_len > 5 else COLORS["text"]
+                    qx, qy = w2s((station.x, station.y + station.height))
+                    self.screen.blit(self.small_font.render(f"Q:{q_len}", True, q_color), (qx, qy + 2))
 
         # Students
+        student_radius = max(2, int(STUDENT_RADIUS * self.zoom))
         for student in self.students:
             if student.state != StudentState.EXITED:
+                sx, sy = w2s((student.x, student.y))
+
                 # Debug: draw path
                 if self.debug_paths and student.path:
-                    points = [(int(student.x), int(student.y))] + [(int(p[0]), int(p[1])) for p in student.path]
+                    points = [w2s((student.x, student.y))] + [w2s(p) for p in student.path]
+                    points = [(int(p[0]), int(p[1])) for p in points]
                     if len(points) > 1:
                         pygame.draw.lines(self.screen, (100, 200, 255), False, points, 1)
-                        # Draw target marker
                         if student.target:
-                            pygame.draw.circle(self.screen, (255, 100, 100), (int(student.target[0]), int(student.target[1])), 4, 1)
+                            tx, ty = w2s(student.target)
+                            pygame.draw.circle(self.screen, (255, 100, 100), (int(tx), int(ty)), 4, 1)
 
                 # Group indicator ring
                 if student.group_id >= 0:
-                    pygame.draw.circle(self.screen, COLORS["group_ring"], (int(student.x), int(student.y)), STUDENT_RADIUS + 2, 1)
+                    pygame.draw.circle(self.screen, COLORS["group_ring"], (int(sx), int(sy)), student_radius + 2, 1)
 
                 # Highlight selected student
                 if student == self.selected_student:
-                    pygame.draw.circle(self.screen, COLORS["student_selected"], (int(student.x), int(student.y)), STUDENT_RADIUS + 3, 2)
+                    pygame.draw.circle(self.screen, COLORS["student_selected"], (int(sx), int(sy)), student_radius + 3, 2)
 
-                pygame.draw.circle(self.screen, student.color, (int(student.x), int(student.y)), STUDENT_RADIUS)
+                pygame.draw.circle(self.screen, student.color, (int(sx), int(sy)), student_radius)
                 if student.has_food:
-                    pygame.draw.circle(self.screen, COLORS["student_has_food"], (int(student.x), int(student.y)), 2)
+                    pygame.draw.circle(self.screen, COLORS["student_has_food"], (int(sx), int(sy)), max(1, int(2 * self.zoom)))
+
+        # Reset clip and draw UI
+        self.screen.set_clip(None)
 
         # UI
         self.draw_ui()
@@ -2645,8 +2701,8 @@ class DiningHallSimulation:
 
     def screen_to_world(self, pos):
         """Convert screen coordinates to world coordinates"""
-        x = (pos[0] / self.zoom) + self.camera_x
-        y = (pos[1] / self.zoom) + self.camera_y
+        x = int((pos[0] / self.zoom) + self.camera_x)
+        y = int((pos[1] / self.zoom) + self.camera_y)
         return (x, y)
 
     def world_to_screen(self, pos):
