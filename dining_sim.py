@@ -1989,7 +1989,12 @@ class DiningHallSimulation:
         if student.state == StudentState.ENTERING:
             # Pick random stations to walk past before choosing one
             if self.stations:
-                num_visits = random.randint(LOOK_VISITS_MIN, min(LOOK_VISITS_MAX, len(self.stations)))
+                max_visits = min(LOOK_VISITS_MAX, len(self.stations))
+                if max_visits < LOOK_VISITS_MIN:
+                    # Not enough stations - just visit what's available
+                    num_visits = max_visits
+                else:
+                    num_visits = random.randint(LOOK_VISITS_MIN, max_visits)
                 student.stations_to_visit = random.sample(self.stations, num_visits)
                 # Set first station to walk toward
                 first_station = student.stations_to_visit[0]
