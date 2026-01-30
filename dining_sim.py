@@ -181,10 +181,8 @@ FOOD_CATEGORIES = [
 
 class StudentState(Enum):
     ENTERING = "entering"
-    LOOKING_AROUND = "looking"  # Surveying station options before deciding
+    LOOKING_AROUND = "looking"  # Walking past stations before deciding
     WALKING_TO_STATION = "walking"
-    ENTERING_FLOW_ZONE = "entering_zone"
-    WAITING_FOR_FLOW = "waiting_flow"  # Waiting in natural queue for flow zone
     IN_FLOW_ZONE = "in_flow"
     QUEUING = "queuing"
     BEING_SERVED = "being_served"
@@ -575,7 +573,6 @@ class Student:
             StudentState.ENTERING: "Just entered",
             StudentState.LOOKING_AROUND: "Looking at options",
             StudentState.WALKING_TO_STATION: f"Walking to {self.target_station.name if self.target_station else 'station'}",
-            StudentState.WAITING_FOR_FLOW: f"Waiting for {self.target_station.name if self.target_station else 'station'}",
             StudentState.IN_FLOW_ZONE: f"In flow zone at {self.target_station.name if self.target_station else 'station'}",
             StudentState.QUEUING: f"Waiting in queue at {self.target_station.name if self.target_station else 'station'}",
             StudentState.BEING_SERVED: f"Being served at {self.target_station.name if self.target_station else 'station'}",
@@ -1799,45 +1796,6 @@ class DiningHallSimulation:
         if student.target:
             student.path = self.pathfinder.find_path(student.pos, student.target)
 
-    def assign_flow_queue_position(self, student, station):
-        """Assign student to natural queue for flow-through station"""
-        # Find students already waiting for or in this flow zone
-        waiting = [s for s in self.students
-                   if s.target_station == station and s.id != student.id
-                   and s.state in [StudentState.WAITING_FOR_FLOW, StudentState.WALKING_TO_STATION]]
-
-        in_zone = [s for s in station.flow_positions]
-
-        if len(in_zone) < 5 and not waiting:
-            # Zone has space and no queue - go directly
-            student.target = station.get_flow_entry_point()
-            student.path = self.pathfinder.find_path(student.pos, student.target)
-            student.state = StudentState.WALKING_TO_STATION
-            student.following_student = -1
-        else:
-            # Need to wait - find who to follow
-            if waiting:
-                # Find the last person in waiting queue (furthest from entry)
-                entry_pt = station.get_flow_entry_point()
-                waiting.sort(key=lambda s: math.hypot(s.x - entry_pt[0], s.y - entry_pt[1]), reverse=True)
-                leader = waiting[0]
-                student.following_student = leader.id
-            elif in_zone:
-                # Follow the last person to enter the zone
-                student.following_student = in_zone[-1].id if in_zone else -1
-            else:
-                student.following_student = -1
-
-            student.state = StudentState.WAITING_FOR_FLOW
-            student.target = station.get_flow_entry_point()
-
-    def get_student_by_id(self, student_id: int) -> Optional[Student]:
-        """Find a student by their ID"""
-        for s in self.students:
-            if s.id == student_id:
-                return s
-        return None
-
     def get_student_at(self, pos) -> Optional[Student]:
         for s in self.students:
             if s.state != StudentState.EXITED:
@@ -2123,42 +2081,6 @@ class DiningHallSimulation:
                         station.queue.append(student)
                         student.state = StudentState.QUEUING
                         student.stations_visited.append(station.name)
-
-        elif student.state == StudentState.IN_FLOW_ZONE:
-
-        elif student.state == StudentState.WAITING_FOR_FLOW:
-            # Natural queue waiting for flow-through zone
-            station = student.target_station
-            entry_pt = station.get_flow_entry_point()
-
-            # Find who we're following
-            leader = self.get_student_by_id(student.following_student) if student.following_student >= 0 else None
-
-            if leader and leader.state not in [StudentState.EXITED, StudentState.IN_FLOW_ZONE]:
-                # Follow behind leader at a distance
-                dx = leader.x - entry_pt[0]
-                dy = leader.y - entry_pt[1]
-                dist_from_entry = math.hypot(dx, dy)
-                if dist_from_entry > 0:
-                    # Position ourselves behind leader, away from entry
-                    target_x = leader.x + (dx / dist_from_entry) * FLOW_QUEUE_FOLLOW_DISTANCE
-                    target_y = leader.y + (dy / dist_from_entry) * FLOW_QUEUE_FOLLOW_DISTANCE
-                    student.target = (target_x, target_y)
-            else:
-                # No leader or leader entered - we're next
-                student.target = entry_pt
-                student.following_student = -1
-
-            # Move toward target
-            self.move_student(student, student.target)
-
-            # Check if we can enter now
-            if len(station.flow_positions) < 6:
-                dist_to_entry = math.hypot(student.x - entry_pt[0], student.y - entry_pt[1])
-                if dist_to_entry < FLOW_QUEUE_FOLLOW_DISTANCE or student.following_student < 0:
-                    student.target = entry_pt
-                    student.path = self.pathfinder.find_path(student.pos, student.target)
-                    student.state = StudentState.WALKING_TO_STATION
 
         elif student.state == StudentState.IN_FLOW_ZONE:
             student.wait_time += 1
