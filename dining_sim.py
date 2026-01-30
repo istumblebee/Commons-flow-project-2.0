@@ -103,17 +103,14 @@ GROUP_CHANCE = 0.35  # Chance that a spawn is a group
 GROUP_SIZE_MIN = 2
 GROUP_SIZE_MAX = 4
 
-# Looking around behavior
-LOOK_AROUND_TIME_MIN = 60   # Minimum frames to look around (1 sec at 60fps)
-LOOK_AROUND_TIME_MAX = 180  # Maximum frames to look around (3 sec)
-LOOK_AROUND_RADIUS = 40     # How far student moves while looking
+# Looking around behavior - students walk past stations before choosing
+LOOK_VISITS_MIN = 2         # Minimum stations to walk past before choosing
+LOOK_VISITS_MAX = 4         # Maximum stations to walk past
+LOOK_VISIT_RADIUS = 60      # How close to get to a station when "looking"
 
 # Stuck detection and teleport
 STUCK_TELEPORT_THRESHOLD = 180  # Frames before teleporting (3 sec)
 STUCK_MOVEMENT_THRESHOLD = 2.0  # Minimum movement to not be considered stuck
-
-# Natural flow-through queue settings
-FLOW_QUEUE_FOLLOW_DISTANCE = 25  # Distance to maintain behind person ahead
 
 COLORS = {
     "background": (25, 25, 30),
@@ -240,6 +237,7 @@ class Station:
     being_served: list = field(default_factory=list)
     service_timers: dict = field(default_factory=dict)
     queue_direction: str = "down"
+    queue_waypoints: list = field(default_factory=list)  # [(x,y), ...] for curved queues
 
     # Flow-through zone settings
     is_flow_through: bool = False
@@ -294,12 +292,56 @@ class Station:
             return (self.x + self.width + 15, self.y + self.height // 2)
 
     def get_queue_position(self, index: int, walls: list = None) -> Tuple[int, int]:
-        """Get position for person at index in queue (0 = being served)"""
+        """Get position for person at index in queue (0 = being served)
+        If queue_waypoints defined, queue follows that path (can curve around corners).
+        Otherwise uses straight line in queue_direction."""
         service_pt = self.get_service_point()
         if index == 0:
             return service_pt
 
-        # Direction vector for queue
+        # If waypoints defined, follow them
+        if self.queue_waypoints:
+            # Build full queue path: service_pt -> waypoints
+            path = [service_pt] + list(self.queue_waypoints)
+
+            # Calculate total path length and find position at index * QUEUE_SPACING
+            target_dist = index * QUEUE_SPACING
+            traveled = 0
+
+            for i in range(len(path) - 1):
+                p1 = path[i]
+                p2 = path[i + 1]
+                seg_len = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+                if traveled + seg_len >= target_dist:
+                    # Position is on this segment
+                    remaining = target_dist - traveled
+                    if seg_len > 0:
+                        t = remaining / seg_len
+                        px = p1[0] + (p2[0] - p1[0]) * t
+                        py = p1[1] + (p2[1] - p1[1]) * t
+                        return (int(px), int(py))
+                    else:
+                        return (int(p1[0]), int(p1[1]))
+
+                traveled += seg_len
+
+            # Past end of waypoints - extend from last segment
+            if len(path) >= 2:
+                p1 = path[-2]
+                p2 = path[-1]
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                seg_len = math.hypot(dx, dy)
+                if seg_len > 0:
+                    dx /= seg_len
+                    dy /= seg_len
+                extra = target_dist - traveled
+                return (int(p2[0] + dx * extra), int(p2[1] + dy * extra))
+
+            return path[-1] if path else service_pt
+
+        # No waypoints - straight line in queue_direction
         dx, dy = 0, 0
         if self.queue_direction == "down":
             dy = 1
@@ -310,7 +352,6 @@ class Station:
         else:
             dx = 1
 
-        # Calculate position
         px = service_pt[0] + dx * index * QUEUE_SPACING
         py = service_pt[1] + dy * index * QUEUE_SPACING
 
@@ -507,15 +548,13 @@ class Student:
     flow_progress: int = 0
     stations_visited: list = field(default_factory=list)  # Track visited stations
     group_id: int = -1  # -1 means solo, otherwise group identifier
-    # Looking around behavior
-    look_timer: int = 0  # How long to look around
-    look_target: tuple = None  # Point to wander toward while looking
+    # Looking around behavior - walk past stations before choosing
+    stations_to_visit: list = field(default_factory=list)  # Stations to walk past
+    look_target: tuple = None  # Current point walking toward
     # Stuck detection - track previous position
     prev_x: float = 0
     prev_y: float = 0
     truly_stuck_timer: int = 0  # Counter for teleport threshold
-    # Flow-through queue
-    following_student: int = -1  # ID of student ahead in natural queue
 
     @property
     def color(self):
@@ -821,8 +860,15 @@ class StationPropertiesPanel:
         self.elements["q_left"] = Button(x + (btn_w + 3) * 2, y_btn, btn_w, 24, "Left")
         self.elements["q_right"] = Button(x + (btn_w + 3) * 3, y_btn, btn_w, 24, "Right")
 
+        # Queue waypoints (for curved queues around corners)
+        y_wp = y_btn + 35
+        wp_count = len(self.station.queue_waypoints)
+        self.elements["wp_label"] = ("label", f"Queue Path: {wp_count} waypoints", x, y_wp)
+        self.elements["wp_clear"] = Button(x, y_wp + 18, w // 2 - 2, 22, "Clear Path")
+        self.elements["wp_hint"] = ("label", "Right-click to add waypoint", x, y_wp + 42)
+
         # Flow-through toggle
-        y_flow = y + 210
+        y_flow = y + 270  # Shifted down for waypoints section
         self.elements["flow_through"] = Checkbox(x, y_flow, "Flow-Through Zone", self.station.is_flow_through)
 
         # Flow direction
@@ -893,6 +939,12 @@ class StationPropertiesPanel:
             if isinstance(e.get(key), Button) and e[key].handle_event(event):
                 self.station.queue_direction = direction
                 return True
+
+        # Clear waypoints button
+        if isinstance(e.get("wp_clear"), Button) and e["wp_clear"].handle_event(event):
+            self.station.queue_waypoints = []
+            self._create_elements()  # Refresh to update label
+            return True
 
         if isinstance(e.get("flow_through"), Checkbox) and e["flow_through"].handle_event(event):
             self.station.is_flow_through = e["flow_through"].checked
@@ -1475,6 +1527,7 @@ class DiningHallSimulation:
                     color=tuple(s["color"]), food_categories=set(s.get("food_categories", ["pizza"])),
                     popularity=s.get("popularity", 0.5), service_time=s.get("service_time", 6),
                     capacity=s.get("capacity", 1), queue_direction=s.get("queue_direction", "down"),
+                    queue_waypoints=[tuple(p) for p in s.get("queue_waypoints", [])],
                     is_flow_through=s.get("is_flow_through", False),
                     flow_entry_side=s.get("flow_entry_side", "left"),
                     flow_exit_side=s.get("flow_exit_side", "right")
@@ -1512,7 +1565,8 @@ class DiningHallSimulation:
                 "name": s.name, "x": s.x, "y": s.y, "width": s.width, "height": s.height,
                 "color": list(s.color), "food_categories": list(s.food_categories),
                 "popularity": s.popularity, "service_time": s.service_time, "capacity": s.capacity,
-                "queue_direction": s.queue_direction, "is_flow_through": s.is_flow_through,
+                "queue_direction": s.queue_direction, "queue_waypoints": list(s.queue_waypoints),
+                "is_flow_through": s.is_flow_through,
                 "flow_entry_side": s.flow_entry_side, "flow_exit_side": s.flow_exit_side
             } for s in self.stations],
             "tables": [{"x": t.x, "y": t.y, "seats": t.seats, "shape": t.shape} for t in self.tables],
@@ -1533,7 +1587,7 @@ class DiningHallSimulation:
         """Save current layout state for undo"""
         state = {
             "stations": [(s.name, s.x, s.y, s.width, s.height, s.color, list(s.food_categories),
-                         s.popularity, s.service_time, s.capacity, s.queue_direction,
+                         s.popularity, s.service_time, s.capacity, s.queue_direction, list(s.queue_waypoints),
                          s.is_flow_through, s.flow_entry_side, s.flow_exit_side) for s in self.stations],
             "tables": [(t.x, t.y, t.seats, t.shape) for t in self.tables],
             "walls": [(w.x1, w.y1, w.x2, w.y2) for w in self.walls],
@@ -1558,12 +1612,21 @@ class DiningHallSimulation:
         self.stairs.clear()
 
         for s in state["stations"]:
-            self.stations.append(Station(
-                name=s[0], x=s[1], y=s[2], width=s[3], height=s[4], color=s[5],
-                food_categories=set(s[6]), popularity=s[7], service_time=s[8],
-                capacity=s[9], queue_direction=s[10], is_flow_through=s[11],
-                flow_entry_side=s[12], flow_exit_side=s[13]
-            ))
+            # Handle old format (14 fields) vs new format (15 fields with queue_waypoints)
+            if len(s) >= 15:
+                self.stations.append(Station(
+                    name=s[0], x=s[1], y=s[2], width=s[3], height=s[4], color=s[5],
+                    food_categories=set(s[6]), popularity=s[7], service_time=s[8],
+                    capacity=s[9], queue_direction=s[10], queue_waypoints=list(s[11]),
+                    is_flow_through=s[12], flow_entry_side=s[13], flow_exit_side=s[14]
+                ))
+            else:
+                self.stations.append(Station(
+                    name=s[0], x=s[1], y=s[2], width=s[3], height=s[4], color=s[5],
+                    food_categories=set(s[6]), popularity=s[7], service_time=s[8],
+                    capacity=s[9], queue_direction=s[10], is_flow_through=s[11],
+                    flow_entry_side=s[12], flow_exit_side=s[13]
+                ))
         for t in state["tables"]:
             self.tables.append(Table(x=t[0], y=t[1], seats=t[2], shape=t[3]))
         for w in state["walls"]:
@@ -1966,61 +2029,60 @@ class DiningHallSimulation:
                 return
 
         if student.state == StudentState.ENTERING:
-            # Start looking around behavior - happens BEFORE choosing a station
-            student.look_timer = random.randint(LOOK_AROUND_TIME_MIN, LOOK_AROUND_TIME_MAX)
-            angle = random.uniform(0, 2 * math.pi)
-            student.look_target = (
-                student.x + math.cos(angle) * LOOK_AROUND_RADIUS,
-                student.y + math.sin(angle) * LOOK_AROUND_RADIUS
-            )
-            student.state = StudentState.LOOKING_AROUND
-            student.prev_x = student.x
-            student.prev_y = student.y
-
-        elif student.state == StudentState.LOOKING_AROUND:
-            # Wander slowly while surveying options - NO station chosen yet
-            student.look_timer -= 1
-
-            if student.look_target:
-                dx = student.look_target[0] - student.x
-                dy = student.look_target[1] - student.y
-                dist = math.hypot(dx, dy)
-                if dist > 3:
-                    student.vx = (dx / dist) * student.speed * 0.3
-                    student.vy = (dy / dist) * student.speed * 0.3
-                    self.apply_separation(student)
-                    self.apply_wall_avoidance(student)
-                    new_x = student.x + student.vx * self.speed
-                    new_y = student.y + student.vy * self.speed
-                    new_x = max(STUDENT_RADIUS, min(self.world_width - STUDENT_RADIUS, new_x))
-                    new_y = max(STUDENT_RADIUS, min(self.world_height - STUDENT_RADIUS, new_y))
-                    student.x = new_x
-                    student.y = new_y
-                else:
-                    # Pick new wander target
-                    angle = random.uniform(0, 2 * math.pi)
-                    student.look_target = (
-                        student.x + math.cos(angle) * LOOK_AROUND_RADIUS,
-                        student.y + math.sin(angle) * LOOK_AROUND_RADIUS
-                    )
-
-            # Done looking - NOW choose station and commit to it
-            if student.look_timer <= 0:
-                station = self.choose_station(student)
-                if station:
-                    student.target_station = station
-                    if station.is_flow_through:
-                        student.target = station.get_flow_entry_point()
-                    else:
-                        queue_pos = len(station.queue) + len(station.being_served)
-                        student.target = station.get_queue_position(queue_pos)
-                    student.path = self.pathfinder.find_path(student.pos, student.target)
-                    student.state = StudentState.WALKING_TO_STATION
-                elif self.exits:
+            # Pick random stations to walk past before choosing one
+            if self.stations:
+                num_visits = random.randint(LOOK_VISITS_MIN, min(LOOK_VISITS_MAX, len(self.stations)))
+                student.stations_to_visit = random.sample(self.stations, num_visits)
+                # Set first station to walk toward
+                first_station = student.stations_to_visit[0]
+                student.look_target = first_station.center
+                student.path = self.pathfinder.find_path(student.pos, student.look_target)
+                student.state = StudentState.LOOKING_AROUND
+            else:
+                # No stations - just exit
+                if self.exits:
                     e = self.find_exit(student.pos)
                     student.target = e.center
                     student.path = self.pathfinder.find_path(student.pos, student.target)
                     student.state = StudentState.WALKING_TO_EXIT
+            student.prev_x = student.x
+            student.prev_y = student.y
+
+        elif student.state == StudentState.LOOKING_AROUND:
+            # Walk toward current station to "look" at it
+            if student.look_target:
+                dist = math.hypot(student.x - student.look_target[0], student.y - student.look_target[1])
+
+                # Got close enough to current station - move to next or choose
+                if dist < LOOK_VISIT_RADIUS:
+                    if student.stations_to_visit:
+                        student.stations_to_visit.pop(0)
+
+                    if student.stations_to_visit:
+                        # More stations to visit
+                        next_station = student.stations_to_visit[0]
+                        student.look_target = next_station.center
+                        student.path = self.pathfinder.find_path(student.pos, student.look_target)
+                    else:
+                        # Done looking - NOW choose and commit
+                        station = self.choose_station(student)
+                        if station:
+                            student.target_station = station
+                            if station.is_flow_through:
+                                student.target = station.get_flow_entry_point()
+                            else:
+                                queue_pos = len(station.queue) + len(station.being_served)
+                                student.target = station.get_queue_position(queue_pos)
+                            student.path = self.pathfinder.find_path(student.pos, student.target)
+                            student.state = StudentState.WALKING_TO_STATION
+                        elif self.exits:
+                            e = self.find_exit(student.pos)
+                            student.target = e.center
+                            student.path = self.pathfinder.find_path(student.pos, student.target)
+                            student.state = StudentState.WALKING_TO_EXIT
+                else:
+                    # Keep walking toward current look target
+                    self.move_student(student, student.look_target)
 
         elif student.state == StudentState.WALKING_TO_STATION:
             station = student.target_station
@@ -2410,6 +2472,23 @@ class DiningHallSimulation:
                     qx, qy = w2s((station.x, station.y + station.height))
                     self.screen.blit(self.small_font.render(f"Q:{q_len}", True, q_color), (qx, qy + 2))
 
+            # Draw queue path when station is selected (shows where queue bends)
+            if station == self.selected_item and (station.queue_waypoints or self.editor_mode):
+                service_pt = station.get_service_point()
+                path_points = [service_pt] + list(station.queue_waypoints)
+                if len(path_points) >= 1:
+                    # Draw path line
+                    screen_points = [w2s(p) for p in path_points]
+                    screen_points = [(int(p[0]), int(p[1])) for p in screen_points]
+                    if len(screen_points) >= 2:
+                        pygame.draw.lines(self.screen, (255, 200, 100), False, screen_points, 2)
+                    # Draw waypoint markers
+                    for i, pt in enumerate(screen_points):
+                        color = (100, 255, 100) if i == 0 else (255, 200, 100)
+                        pygame.draw.circle(self.screen, color, pt, max(3, int(5 * self.zoom)))
+                        if i == 0 and self.zoom > 0.5:
+                            self.screen.blit(self.small_font.render("SVC", True, COLORS["text"]), (pt[0] + 8, pt[1] - 5))
+
         # Students
         student_radius = max(2, int(STUDENT_RADIUS * self.zoom))
         for student in self.students:
@@ -2596,6 +2675,16 @@ class DiningHallSimulation:
         return (None, None)
 
     def handle_editor_click(self, pos, button):
+        # Right-click to add queue waypoint when station selected
+        if button == 3:
+            if self.selected_type == "station" and self.selected_item:
+                self.save_undo_state()
+                self.selected_item.queue_waypoints.append((int(pos[0]), int(pos[1])))
+                # Refresh panel to update waypoint count
+                if self.station_panel.visible:
+                    self.station_panel._create_elements()
+            return
+
         if button != 1:
             return
         if self.current_tool == EditorTool.SELECT:
