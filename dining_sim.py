@@ -1,7 +1,8 @@
 """
-Dining Hall Flow Simulator v2.5
+Dining Hall Flow Simulator v2.6
 ================================
 Agent-based simulation for analyzing dining hall bottlenecks.
+Supports multi-floor venues with stair portals.
 
 Controls:
     SPACE      - Pause/Resume simulation
@@ -12,6 +13,11 @@ Controls:
     F          - Force all students to recalculate routes
     R          - Reset simulation
     Q/ESC      - Quit
+
+Navigation:
+    Scroll     - Zoom in/out
+    Middle-drag - Pan camera
+    Click toolbar buttons for tools/zoom/floors
 
 When Paused:
     Click on a student to see their stats
@@ -24,6 +30,7 @@ Editor Mode:
     4          - Entrance tool (click to place)
     5          - Exit tool (click to place)
     6          - Dish Return tool (click+drag)
+    7          - Stair Portal tool (click to place)
     DELETE     - Delete item under cursor
     Ctrl+Z     - Undo
     Ctrl+Y     - Redo
@@ -96,6 +103,18 @@ GROUP_CHANCE = 0.35  # Chance that a spawn is a group
 GROUP_SIZE_MIN = 2
 GROUP_SIZE_MAX = 4
 
+# Looking around behavior
+LOOK_AROUND_TIME_MIN = 60   # Minimum frames to look around (1 sec at 60fps)
+LOOK_AROUND_TIME_MAX = 180  # Maximum frames to look around (3 sec)
+LOOK_AROUND_RADIUS = 40     # How far student moves while looking
+
+# Stuck detection and teleport
+STUCK_TELEPORT_THRESHOLD = 180  # Frames before teleporting (3 sec)
+STUCK_MOVEMENT_THRESHOLD = 2.0  # Minimum movement to not be considered stuck
+
+# Natural flow-through queue settings
+FLOW_QUEUE_FOLLOW_DISTANCE = 25  # Distance to maintain behind person ahead
+
 COLORS = {
     "background": (25, 25, 30),
     "grid": (35, 35, 40),
@@ -165,8 +184,10 @@ FOOD_CATEGORIES = [
 
 class StudentState(Enum):
     ENTERING = "entering"
+    LOOKING_AROUND = "looking"  # Surveying station options before deciding
     WALKING_TO_STATION = "walking"
     ENTERING_FLOW_ZONE = "entering_zone"
+    WAITING_FOR_FLOW = "waiting_flow"  # Waiting in natural queue for flow zone
     IN_FLOW_ZONE = "in_flow"
     QUEUING = "queuing"
     BEING_SERVED = "being_served"
@@ -195,6 +216,7 @@ class EditorTool(Enum):
     ENTRANCE = 4
     EXIT = 5
     DISH_RETURN = 6
+    STAIR = 7
 
 
 class TableShape(Enum):
@@ -438,6 +460,27 @@ class Exit:
 
 
 @dataclass
+class Stair:
+    """Portal/staircase connecting two floors"""
+    x: int
+    y: int
+    floor: int = 1  # Which floor this portal is on (1 = ground, 2 = upper)
+    linked_stair_id: int = -1  # ID of the connected stair portal
+    name: str = "Stairs"
+    direction: str = "up"  # "up" = goes to upper floor, "down" = goes to lower floor
+
+    @property
+    def center(self):
+        return (self.x, self.y)
+
+    def __post_init__(self):
+        if not hasattr(Stair, '_id_counter'):
+            Stair._id_counter = 0
+        self.id = Stair._id_counter
+        Stair._id_counter += 1
+
+
+@dataclass
 class Student:
     id: int
     x: float
@@ -464,6 +507,15 @@ class Student:
     flow_progress: int = 0
     stations_visited: list = field(default_factory=list)  # Track visited stations
     group_id: int = -1  # -1 means solo, otherwise group identifier
+    # Looking around behavior
+    look_timer: int = 0  # How long to look around
+    look_target: tuple = None  # Point to wander toward while looking
+    # Stuck detection - track previous position
+    prev_x: float = 0
+    prev_y: float = 0
+    truly_stuck_timer: int = 0  # Counter for teleport threshold
+    # Flow-through queue
+    following_student: int = -1  # ID of student ahead in natural queue
 
     @property
     def color(self):
@@ -482,7 +534,9 @@ class Student:
     def get_state_description(self) -> str:
         descriptions = {
             StudentState.ENTERING: "Just entered",
+            StudentState.LOOKING_AROUND: "Looking at options",
             StudentState.WALKING_TO_STATION: f"Walking to {self.target_station.name if self.target_station else 'station'}",
+            StudentState.WAITING_FOR_FLOW: f"Waiting for {self.target_station.name if self.target_station else 'station'}",
             StudentState.IN_FLOW_ZONE: f"In flow zone at {self.target_station.name if self.target_station else 'station'}",
             StudentState.QUEUING: f"Waiting in queue at {self.target_station.name if self.target_station else 'station'}",
             StudentState.BEING_SERVED: f"Being served at {self.target_station.name if self.target_station else 'station'}",
@@ -1150,6 +1204,130 @@ class StudentInfoPanel:
             screen.blit(self.small_font.render("  (none yet)", True, COLORS["text_muted"]), (x, y))
 
 
+class StairPropertiesPanel:
+    """Properties panel for stair/portal editing"""
+
+    def __init__(self, x, y, width, height):
+        self.rect = pygame.Rect(x, y, width, height)
+        self.visible = False
+        self.stair = None
+        self.font = None
+        self.small_font = None
+        self.name_input = None
+        self.link_buttons = []  # Will be populated with available stairs to link
+        self.simulation = None  # Reference to simulation for getting stairs
+
+    def init_fonts(self, font, small_font):
+        self.font = font
+        self.small_font = small_font
+        self.name_input = TextInput(self.rect.x + 10, self.rect.y + 45, self.rect.width - 20, "", "Name")
+
+    def show(self, stair, simulation):
+        self.stair = stair
+        self.simulation = simulation
+        self.visible = True
+        self.name_input.value = stair.name
+
+    def hide(self):
+        self.visible = False
+        self.stair = None
+
+    def handle_event(self, event) -> bool:
+        if not self.visible:
+            return False
+
+        if self.name_input and self.name_input.handle_event(event):
+            if self.stair:
+                self.stair.name = self.name_input.value
+            return True
+
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            # Check link buttons
+            for btn_rect, target_stair in self.link_buttons:
+                if btn_rect.collidepoint(event.pos):
+                    self.link_stairs(target_stair)
+                    return True
+
+        return self.rect.collidepoint(pygame.mouse.get_pos())
+
+    def link_stairs(self, other_stair):
+        """Link this stair to another stair (and vice versa)"""
+        if self.stair and other_stair and self.stair != other_stair:
+            # Unlink old connections
+            if self.stair.linked_stair_id >= 0:
+                for s in self.simulation.stairs:
+                    if s.id == self.stair.linked_stair_id:
+                        s.linked_stair_id = -1
+            if other_stair.linked_stair_id >= 0:
+                for s in self.simulation.stairs:
+                    if s.id == other_stair.linked_stair_id:
+                        s.linked_stair_id = -1
+            # Create new link
+            self.stair.linked_stair_id = other_stair.id
+            other_stair.linked_stair_id = self.stair.id
+
+    def draw(self, screen):
+        if not self.visible or not self.stair:
+            return
+
+        pygame.draw.rect(screen, COLORS["panel_bg"], self.rect)
+        pygame.draw.rect(screen, COLORS["selected"], self.rect, 2)
+
+        y = self.rect.y + 10
+        screen.blit(self.font.render("Stair Portal", True, COLORS["text"]), (self.rect.x + 10, y))
+        y += 25
+
+        self.name_input.rect.y = y
+        self.name_input.draw(screen, self.small_font)
+        y += 50
+
+        # Floor info
+        screen.blit(self.small_font.render(f"Floor: {self.stair.floor}", True, COLORS["text"]), (self.rect.x + 10, y))
+        y += 22
+
+        # Direction toggle
+        dir_text = f"Direction: {self.stair.direction.upper()}"
+        screen.blit(self.small_font.render(dir_text, True, COLORS["text"]), (self.rect.x + 10, y))
+        toggle_rect = pygame.Rect(self.rect.x + 120, y - 2, 60, 20)
+        pygame.draw.rect(screen, COLORS["button"], toggle_rect, border_radius=3)
+        screen.blit(self.small_font.render("Toggle", True, COLORS["text"]), (self.rect.x + 128, y))
+        y += 30
+
+        # Current link status
+        linked = None
+        for s in self.simulation.stairs:
+            if s.id == self.stair.linked_stair_id:
+                linked = s
+                break
+
+        if linked:
+            link_text = f"Linked to: {linked.name} (F{linked.floor})"
+            screen.blit(self.small_font.render(link_text, True, (100, 255, 100)), (self.rect.x + 10, y))
+        else:
+            screen.blit(self.small_font.render("Not linked", True, (255, 100, 100)), (self.rect.x + 10, y))
+        y += 30
+
+        # Available stairs to link
+        screen.blit(self.small_font.render("Link to:", True, COLORS["text"]), (self.rect.x + 10, y))
+        y += 22
+
+        self.link_buttons = []
+        other_stairs = [s for s in self.simulation.stairs if s.id != self.stair.id]
+
+        for other in other_stairs[:6]:  # Max 6 buttons
+            btn_rect = pygame.Rect(self.rect.x + 10, y, self.rect.width - 20, 22)
+            self.link_buttons.append((btn_rect, other))
+            is_linked = other.id == self.stair.linked_stair_id
+            btn_color = COLORS["button_active"] if is_linked else COLORS["button"]
+            pygame.draw.rect(screen, btn_color, btn_rect, border_radius=3)
+            btn_text = f"{other.name} (F{other.floor})"
+            screen.blit(self.small_font.render(btn_text, True, COLORS["text"]), (self.rect.x + 15, y + 3))
+            y += 26
+
+        if not other_stairs:
+            screen.blit(self.small_font.render("No other stairs to link", True, COLORS["text_muted"]), (self.rect.x + 10, y))
+
+
 # ============================================================================
 # MAIN SIMULATION
 # ============================================================================
@@ -1158,7 +1336,7 @@ class DiningHallSimulation:
     def __init__(self):
         pygame.init()
         self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-        pygame.display.set_caption("Dining Hall Flow Simulator v2.5")
+        pygame.display.set_caption("Dining Hall Flow Simulator v2.6")
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 24)
         self.small_font = pygame.font.Font(None, 18)
@@ -1182,7 +1360,21 @@ class DiningHallSimulation:
         self.entrances: List[Entrance] = []
         self.exits: List[Exit] = []
         self.dish_returns: List[DishReturn] = []
+        self.stairs: List[Stair] = []
         self.students: List[Student] = []
+
+        # Zoom and floor system
+        self.zoom = 1.0
+        self.zoom_min = 0.25
+        self.zoom_max = 3.0
+        self.camera_x = 0
+        self.camera_y = 0
+        self.current_floor = 1  # 1 = ground floor, 2 = upper floor
+        self.dragging_camera = False
+        self.last_mouse_pos = None
+
+        # Toolbar button rectangles (will be set in draw_toolbar)
+        self.toolbar_buttons = []
 
         self.pathfinder = Pathfinder(self.play_area.width, WINDOW_HEIGHT, GRID_SIZE)
         self.background_image = None
@@ -1199,6 +1391,8 @@ class DiningHallSimulation:
         self.table_panel.init_fonts(self.font, self.small_font)
         self.dish_panel = DishReturnPropertiesPanel(WINDOW_WIDTH - PANEL_WIDTH, 0, PANEL_WIDTH, WINDOW_HEIGHT)
         self.dish_panel.init_fonts(self.font, self.small_font)
+        self.stair_panel = StairPropertiesPanel(WINDOW_WIDTH - PANEL_WIDTH, 0, PANEL_WIDTH, 350)
+        self.stair_panel.init_fonts(self.font, self.small_font)
         self.student_panel = StudentInfoPanel(10, 170, 220, 240)
         self.student_panel.init_fonts(self.font, self.small_font)
 
@@ -1223,6 +1417,7 @@ class DiningHallSimulation:
         self.station_panel.hide()
         self.table_panel.hide()
         self.dish_panel.hide()
+        self.stair_panel.hide()
 
     def select_item(self, item_type, item):
         self.selected_item = item
@@ -1234,6 +1429,8 @@ class DiningHallSimulation:
             self.table_panel.show(item)
         elif item_type == "dish_return":
             self.dish_panel.show(item)
+        elif item_type == "stair":
+            self.stair_panel.show(item, self)
 
     def load_background_image(self, path=None):
         if path is None:
@@ -1281,6 +1478,15 @@ class DiningHallSimulation:
                 self.dish_returns.append(DishReturn(x=d["x"], y=d["y"], width=d.get("width", 60),
                     height=d.get("height", 40), capacity=d.get("capacity", 1),
                     queue_direction=d.get("queue_direction", "down")))
+            for s in data.get("stairs", []):
+                stair = Stair(
+                    x=s["x"], y=s["y"], floor=s.get("floor", 1),
+                    name=s.get("name", "Stairs"), direction=s.get("direction", "up"),
+                    linked_stair_id=s.get("linked_stair_id", -1)
+                )
+                if "id" in s:
+                    stair.id = s["id"]
+                self.stairs.append(stair)
             self.update_pathfinding()
             self.save_undo_state()  # Initial state for undo
         except Exception as e:
@@ -1301,7 +1507,9 @@ class DiningHallSimulation:
             "entrances": [{"x": e.x, "y": e.y} for e in self.entrances],
             "exits": [{"x": e.x, "y": e.y} for e in self.exits],
             "dish_returns": [{"x": d.x, "y": d.y, "width": d.width, "height": d.height,
-                "capacity": d.capacity, "queue_direction": d.queue_direction} for d in self.dish_returns]
+                "capacity": d.capacity, "queue_direction": d.queue_direction} for d in self.dish_returns],
+            "stairs": [{"id": s.id, "x": s.x, "y": s.y, "floor": s.floor, "name": s.name,
+                "direction": s.direction, "linked_stair_id": s.linked_stair_id} for s in self.stairs]
         }
         Path("config").mkdir(exist_ok=True)
         with open("config/layout.json", "w") as f:
@@ -1319,6 +1527,7 @@ class DiningHallSimulation:
             "entrances": [(e.x, e.y) for e in self.entrances],
             "exits": [(e.x, e.y) for e in self.exits],
             "dish_returns": [(d.x, d.y, d.width, d.height, d.capacity, d.queue_direction) for d in self.dish_returns],
+            "stairs": [(s.id, s.x, s.y, s.floor, s.name, s.direction, s.linked_stair_id) for s in self.stairs],
         }
         self.undo_history.append(state)
         if len(self.undo_history) > self.max_undo:
@@ -1333,6 +1542,7 @@ class DiningHallSimulation:
         self.entrances.clear()
         self.exits.clear()
         self.dish_returns.clear()
+        self.stairs.clear()
 
         for s in state["stations"]:
             self.stations.append(Station(
@@ -1351,6 +1561,10 @@ class DiningHallSimulation:
             self.exits.append(Exit(x=e[0], y=e[1]))
         for d in state["dish_returns"]:
             self.dish_returns.append(DishReturn(x=d[0], y=d[1], width=d[2], height=d[3], capacity=d[4], queue_direction=d[5]))
+        for s in state.get("stairs", []):
+            stair = Stair(x=s[1], y=s[2], floor=s[3], name=s[4], direction=s[5], linked_stair_id=s[6])
+            stair.id = s[0]  # Preserve original ID
+            self.stairs.append(stair)
 
         self.selected_item = None
         self.hide_all_panels()
@@ -1484,6 +1698,69 @@ class DiningHallSimulation:
         if not self.exits:
             return None
         return min(self.exits, key=lambda e: math.hypot(e.x - pos[0], e.y - pos[1]))
+
+    def teleport_to_safe_zone(self, student):
+        """Teleport a stuck student to a safe zone near an entrance"""
+        if self.entrances:
+            entrance = random.choice(self.entrances)
+            # Offset slightly from entrance
+            angle = random.uniform(0, 2 * math.pi)
+            offset = random.uniform(20, 40)
+            student.x = entrance.x + math.cos(angle) * offset
+            student.y = entrance.y + math.sin(angle) * offset
+        else:
+            # No entrances - teleport to center of play area
+            student.x = self.play_area.width // 2 + random.randint(-50, 50)
+            student.y = WINDOW_HEIGHT // 2 + random.randint(-50, 50)
+
+        # Reset stuck timer and recalculate path
+        student.truly_stuck_timer = 0
+        student.stuck_timer = 0
+        student.prev_x = student.x
+        student.prev_y = student.y
+
+        # Recalculate path to target
+        if student.target:
+            student.path = self.pathfinder.find_path(student.pos, student.target)
+
+    def assign_flow_queue_position(self, student, station):
+        """Assign student to natural queue for flow-through station"""
+        # Find students already waiting for or in this flow zone
+        waiting = [s for s in self.students
+                   if s.target_station == station and s.id != student.id
+                   and s.state in [StudentState.WAITING_FOR_FLOW, StudentState.WALKING_TO_STATION]]
+
+        in_zone = [s for s in station.flow_positions]
+
+        if len(in_zone) < 5 and not waiting:
+            # Zone has space and no queue - go directly
+            student.target = station.get_flow_entry_point()
+            student.path = self.pathfinder.find_path(student.pos, student.target)
+            student.state = StudentState.WALKING_TO_STATION
+            student.following_student = -1
+        else:
+            # Need to wait - find who to follow
+            if waiting:
+                # Find the last person in waiting queue (furthest from entry)
+                entry_pt = station.get_flow_entry_point()
+                waiting.sort(key=lambda s: math.hypot(s.x - entry_pt[0], s.y - entry_pt[1]), reverse=True)
+                leader = waiting[0]
+                student.following_student = leader.id
+            elif in_zone:
+                # Follow the last person to enter the zone
+                student.following_student = in_zone[-1].id if in_zone else -1
+            else:
+                student.following_student = -1
+
+            student.state = StudentState.WAITING_FOR_FLOW
+            student.target = station.get_flow_entry_point()
+
+    def get_student_by_id(self, student_id: int) -> Optional[Student]:
+        """Find a student by their ID"""
+        for s in self.students:
+            if s.id == student_id:
+                return s
+        return None
 
     def get_student_at(self, pos) -> Optional[Student]:
         for s in self.students:
@@ -1659,31 +1936,97 @@ class DiningHallSimulation:
     def update_student(self, student):
         student.time_in_system += 1
 
+        # Track position history for stuck detection
+        if student.state in [StudentState.WALKING_TO_STATION, StudentState.WALKING_TO_TABLE,
+                             StudentState.WALKING_TO_DISH_RETURN, StudentState.WAITING_FOR_FLOW]:
+            moved = math.hypot(student.x - student.prev_x, student.y - student.prev_y)
+            if moved < STUCK_MOVEMENT_THRESHOLD:
+                student.truly_stuck_timer += 1
+            else:
+                student.truly_stuck_timer = 0
+            student.prev_x = student.x
+            student.prev_y = student.y
+
+            # Teleport if truly stuck for too long
+            if student.truly_stuck_timer > STUCK_TELEPORT_THRESHOLD:
+                self.teleport_to_safe_zone(student)
+                return
+
         if student.state == StudentState.ENTERING:
-            station = self.choose_station(student)
-            if station:
-                student.target_station = station
-                if station.is_flow_through:
-                    student.target = station.get_flow_entry_point()
+            # Transition to looking around behavior
+            student.look_timer = random.randint(LOOK_AROUND_TIME_MIN, LOOK_AROUND_TIME_MAX)
+            # Pick a random nearby point to wander toward while looking
+            angle = random.uniform(0, 2 * math.pi)
+            student.look_target = (
+                student.x + math.cos(angle) * LOOK_AROUND_RADIUS,
+                student.y + math.sin(angle) * LOOK_AROUND_RADIUS
+            )
+            student.state = StudentState.LOOKING_AROUND
+            student.prev_x = student.x
+            student.prev_y = student.y
+
+        elif student.state == StudentState.LOOKING_AROUND:
+            # Slowly wander while "looking around" at stations
+            student.look_timer -= 1
+
+            # Gently move toward look target (slower than normal)
+            if student.look_target:
+                dx = student.look_target[0] - student.x
+                dy = student.look_target[1] - student.y
+                dist = math.hypot(dx, dy)
+                if dist > 3:
+                    student.vx = (dx / dist) * student.speed * 0.3
+                    student.vy = (dy / dist) * student.speed * 0.3
+                    self.apply_separation(student)
+                    self.apply_wall_avoidance(student)
+                    new_x = student.x + student.vx * self.speed
+                    new_y = student.y + student.vy * self.speed
+                    # Keep in bounds
+                    new_x = max(STUDENT_RADIUS, min(self.play_area.width - STUDENT_RADIUS, new_x))
+                    new_y = max(STUDENT_RADIUS, min(WINDOW_HEIGHT - STUDENT_RADIUS, new_y))
+                    student.x = new_x
+                    student.y = new_y
                 else:
-                    # Join end of queue
-                    queue_pos = len(station.queue) + len(station.being_served)
-                    student.target = station.get_queue_position(queue_pos)
-                student.path = self.pathfinder.find_path(student.pos, student.target)
-                student.state = StudentState.WALKING_TO_STATION
-            elif self.exits:
-                e = self.find_exit(student.pos)
-                student.target = e.center
-                student.path = self.pathfinder.find_path(student.pos, student.target)
-                student.state = StudentState.WALKING_TO_EXIT
+                    # Pick new look target
+                    angle = random.uniform(0, 2 * math.pi)
+                    student.look_target = (
+                        student.x + math.cos(angle) * LOOK_AROUND_RADIUS,
+                        student.y + math.sin(angle) * LOOK_AROUND_RADIUS
+                    )
+
+            # Done looking - now choose station
+            if student.look_timer <= 0:
+                station = self.choose_station(student)
+                if station:
+                    student.target_station = station
+                    if station.is_flow_through:
+                        # Check if we need to wait in a natural queue
+                        self.assign_flow_queue_position(student, station)
+                    else:
+                        # Join end of queue
+                        queue_pos = len(station.queue) + len(station.being_served)
+                        student.target = station.get_queue_position(queue_pos)
+                        student.path = self.pathfinder.find_path(student.pos, student.target)
+                        student.state = StudentState.WALKING_TO_STATION
+                elif self.exits:
+                    e = self.find_exit(student.pos)
+                    student.target = e.center
+                    student.path = self.pathfinder.find_path(student.pos, student.target)
+                    student.state = StudentState.WALKING_TO_EXIT
 
         elif student.state == StudentState.WALKING_TO_STATION:
             station = student.target_station
             if station.is_flow_through:
                 if self.move_student(student, student.target):
-                    station.flow_positions.append(student)
-                    student.flow_progress = 0
-                    student.state = StudentState.IN_FLOW_ZONE
+                    # Check if zone has space
+                    if len(station.flow_positions) < 6:
+                        station.flow_positions.append(student)
+                        student.flow_progress = 0
+                        student.state = StudentState.IN_FLOW_ZONE
+                        student.following_student = -1
+                    else:
+                        # Zone full - wait outside
+                        student.state = StudentState.WAITING_FOR_FLOW
             else:
                 # Get current queue end position
                 queue_pos = len(station.queue) + len(station.being_served)
@@ -1721,6 +2064,40 @@ class DiningHallSimulation:
                         station.queue.append(student)
                         student.state = StudentState.QUEUING
                         student.stations_visited.append(station.name)
+
+        elif student.state == StudentState.WAITING_FOR_FLOW:
+            # Natural queue waiting for flow-through zone
+            station = student.target_station
+            entry_pt = station.get_flow_entry_point()
+
+            # Find who we're following
+            leader = self.get_student_by_id(student.following_student) if student.following_student >= 0 else None
+
+            if leader and leader.state not in [StudentState.EXITED, StudentState.IN_FLOW_ZONE]:
+                # Follow behind leader at a distance
+                dx = leader.x - entry_pt[0]
+                dy = leader.y - entry_pt[1]
+                dist_from_entry = math.hypot(dx, dy)
+                if dist_from_entry > 0:
+                    # Position ourselves behind leader, away from entry
+                    target_x = leader.x + (dx / dist_from_entry) * FLOW_QUEUE_FOLLOW_DISTANCE
+                    target_y = leader.y + (dy / dist_from_entry) * FLOW_QUEUE_FOLLOW_DISTANCE
+                    student.target = (target_x, target_y)
+            else:
+                # No leader or leader entered - we're next
+                student.target = entry_pt
+                student.following_student = -1
+
+            # Move toward target
+            self.move_student(student, student.target)
+
+            # Check if we can enter now
+            if len(station.flow_positions) < 6:
+                dist_to_entry = math.hypot(student.x - entry_pt[0], student.y - entry_pt[1])
+                if dist_to_entry < FLOW_QUEUE_FOLLOW_DISTANCE or student.following_student < 0:
+                    student.target = entry_pt
+                    student.path = self.pathfinder.find_path(student.pos, student.target)
+                    student.state = StudentState.WALKING_TO_STATION
 
         elif student.state == StudentState.IN_FLOW_ZONE:
             student.wait_time += 1
@@ -1928,6 +2305,31 @@ class DiningHallSimulation:
             pygame.draw.circle(self.screen, (255, 255, 255), ext.center, 16, 2)
             self.screen.blit(self.small_font.render("OUT", True, COLORS["text_dark"]), (ext.x - 10, ext.y - 5))
 
+        # Stairs (portals)
+        for stair in self.stairs:
+            # Only draw stairs on current floor
+            if stair.floor == self.current_floor:
+                # Stair color - cyan for up, orange for down
+                stair_color = (100, 200, 255) if stair.direction == "up" else (255, 180, 100)
+                pygame.draw.rect(self.screen, stair_color, (stair.x - 15, stair.y - 15, 30, 30))
+                pygame.draw.rect(self.screen, COLORS["selected"] if stair == self.selected_item else (255, 255, 255),
+                               (stair.x - 15, stair.y - 15, 30, 30), 2)
+                # Draw stairs icon (lines)
+                for i in range(3):
+                    line_y = stair.y - 8 + i * 6
+                    pygame.draw.line(self.screen, COLORS["text_dark"], (stair.x - 8, line_y), (stair.x + 8, line_y), 2)
+                # Direction arrow
+                if stair.direction == "up":
+                    pygame.draw.polygon(self.screen, COLORS["text_dark"],
+                                       [(stair.x, stair.y - 12), (stair.x - 5, stair.y - 6), (stair.x + 5, stair.y - 6)])
+                else:
+                    pygame.draw.polygon(self.screen, COLORS["text_dark"],
+                                       [(stair.x, stair.y + 12), (stair.x - 5, stair.y + 6), (stair.x + 5, stair.y + 6)])
+                # Show if linked
+                linked = self.get_linked_stair(stair)
+                link_text = "Linked" if linked else "Unlinked"
+                self.screen.blit(self.small_font.render(link_text, True, COLORS["text"]), (stair.x - 18, stair.y + 18))
+
         # Dish returns
         for dr in self.dish_returns:
             rect = pygame.Rect(dr.x, dr.y, dr.width, dr.height)
@@ -2002,6 +2404,7 @@ class DiningHallSimulation:
         self.station_panel.draw(self.screen)
         self.table_panel.draw(self.screen)
         self.dish_panel.draw(self.screen)
+        self.stair_panel.draw(self.screen)
 
         # Student info panel
         if self.selected_student and self.paused and not self.editor_mode:
@@ -2060,18 +2463,70 @@ class DiningHallSimulation:
         y = WINDOW_HEIGHT - 50
         pygame.draw.rect(self.screen, COLORS["ui_bg"], (0, y, self.play_area.width, 50))
         pygame.draw.line(self.screen, (80, 80, 80), (0, y), (self.play_area.width, y))
-        tools = [(EditorTool.SELECT, "0:Select"), (EditorTool.STATION, "1:Station"), (EditorTool.TABLE, "2:Table"),
-                 (EditorTool.WALL, "3:Wall"), (EditorTool.ENTRANCE, "4:Enter"), (EditorTool.EXIT, "5:Exit"),
-                 (EditorTool.DISH_RETURN, "6:Dishes")]
+
+        tools = [(EditorTool.SELECT, "Select"), (EditorTool.STATION, "Station"), (EditorTool.TABLE, "Table"),
+                 (EditorTool.WALL, "Wall"), (EditorTool.ENTRANCE, "Enter"), (EditorTool.EXIT, "Exit"),
+                 (EditorTool.DISH_RETURN, "Dishes"), (EditorTool.STAIR, "Stairs")]
+
+        self.toolbar_buttons = []  # Reset button list
         x = 10
         for tool, label in tools:
             active = self.current_tool == tool
-            rect = pygame.Rect(x, y + 8, 75, 34)
+            rect = pygame.Rect(x, y + 8, 65, 34)
+            self.toolbar_buttons.append((rect, tool))  # Store for click detection
             pygame.draw.rect(self.screen, COLORS["button_active"] if active else COLORS["button"], rect, border_radius=4)
             pygame.draw.rect(self.screen, (120, 120, 120) if active else (80, 80, 80), rect, 1, border_radius=4)
-            self.screen.blit(self.small_font.render(label, True, COLORS["text"]), (x + 6, y + 16))
-            x += 82
-        self.screen.blit(self.small_font.render("DEL=Delete C=Clear | Click items to edit", True, COLORS["text_muted"]), (x + 10, y + 18))
+            self.screen.blit(self.small_font.render(label, True, COLORS["text"]), (x + 4, y + 16))
+            x += 70
+
+        # Separator
+        x += 10
+        pygame.draw.line(self.screen, (80, 80, 80), (x, y + 8), (x, y + 42))
+        x += 10
+
+        # Zoom controls
+        zoom_out_rect = pygame.Rect(x, y + 8, 30, 34)
+        self.toolbar_buttons.append((zoom_out_rect, "zoom_out"))
+        pygame.draw.rect(self.screen, COLORS["button"], zoom_out_rect, border_radius=4)
+        pygame.draw.rect(self.screen, (80, 80, 80), zoom_out_rect, 1, border_radius=4)
+        self.screen.blit(self.font.render("-", True, COLORS["text"]), (x + 10, y + 12))
+        x += 35
+
+        zoom_text = f"{int(self.zoom * 100)}%"
+        self.screen.blit(self.small_font.render(zoom_text, True, COLORS["text"]), (x, y + 18))
+        x += 40
+
+        zoom_in_rect = pygame.Rect(x, y + 8, 30, 34)
+        self.toolbar_buttons.append((zoom_in_rect, "zoom_in"))
+        pygame.draw.rect(self.screen, COLORS["button"], zoom_in_rect, border_radius=4)
+        pygame.draw.rect(self.screen, (80, 80, 80), zoom_in_rect, 1, border_radius=4)
+        self.screen.blit(self.font.render("+", True, COLORS["text"]), (x + 8, y + 12))
+        x += 35
+
+        # Reset zoom button
+        reset_rect = pygame.Rect(x, y + 8, 40, 34)
+        self.toolbar_buttons.append((reset_rect, "zoom_reset"))
+        pygame.draw.rect(self.screen, COLORS["button"], reset_rect, border_radius=4)
+        pygame.draw.rect(self.screen, (80, 80, 80), reset_rect, 1, border_radius=4)
+        self.screen.blit(self.small_font.render("1:1", True, COLORS["text"]), (x + 8, y + 16))
+        x += 50
+
+        # Separator
+        pygame.draw.line(self.screen, (80, 80, 80), (x, y + 8), (x, y + 42))
+        x += 10
+
+        # Floor selector
+        for floor_num in [1, 2]:
+            active = self.current_floor == floor_num
+            floor_rect = pygame.Rect(x, y + 8, 50, 34)
+            self.toolbar_buttons.append((floor_rect, f"floor_{floor_num}"))
+            pygame.draw.rect(self.screen, COLORS["button_active"] if active else COLORS["button"], floor_rect, border_radius=4)
+            pygame.draw.rect(self.screen, (120, 120, 120) if active else (80, 80, 80), floor_rect, 1, border_radius=4)
+            self.screen.blit(self.small_font.render(f"F{floor_num}", True, COLORS["text"]), (x + 14, y + 16))
+            x += 55
+
+        # Instructions
+        self.screen.blit(self.small_font.render("DEL=Delete | Scroll=Zoom | Middle=Pan", True, COLORS["text_muted"]), (x + 10, y + 18))
 
     def get_item_at(self, pos):
         x, y = pos
@@ -2093,6 +2548,9 @@ class DiningHallSimulation:
         for d in self.dish_returns:
             if d.x <= x <= d.x + d.width and d.y <= y <= d.y + d.height:
                 return ("dish_return", d)
+        for s in self.stairs:
+            if s.floor == self.current_floor and math.hypot(s.x - x, s.y - y) < 20:
+                return ("stair", s)
         return (None, None)
 
     def handle_editor_click(self, pos, button):
@@ -2117,10 +2575,22 @@ class DiningHallSimulation:
             self.update_pathfinding()
         elif self.current_tool == EditorTool.ENTRANCE:
             self.save_undo_state()
-            self.entrances.append(Entrance(x=pos[0], y=pos[1]))
+            self.entrances.append(Entrance(x=int(pos[0]), y=int(pos[1])))
         elif self.current_tool == EditorTool.EXIT:
             self.save_undo_state()
-            self.exits.append(Exit(x=pos[0], y=pos[1]))
+            self.exits.append(Exit(x=int(pos[0]), y=int(pos[1])))
+        elif self.current_tool == EditorTool.STAIR:
+            self.save_undo_state()
+            # Create a stair portal for current floor
+            stair = Stair(
+                x=int(pos[0]),
+                y=int(pos[1]),
+                floor=self.current_floor,
+                name=f"Stair {len(self.stairs) + 1}",
+                direction="up" if self.current_floor == 1 else "down"
+            )
+            self.stairs.append(stair)
+            self.select_item("stair", stair)
 
     def handle_editor_release(self, pos):
         if not self.drawing or not self.draw_start:
@@ -2162,10 +2632,74 @@ class DiningHallSimulation:
             self.exits.remove(item)
         elif item_type == "dish_return":
             self.dish_returns.remove(item)
+        elif item_type == "stair":
+            # Unlink any connected stair
+            linked = self.get_linked_stair(item)
+            if linked:
+                linked.linked_stair_id = -1
+            self.stairs.remove(item)
         if item == self.selected_item:
             self.selected_item = None
             self.hide_all_panels()
         self.update_pathfinding()
+
+    def screen_to_world(self, pos):
+        """Convert screen coordinates to world coordinates"""
+        x = (pos[0] / self.zoom) + self.camera_x
+        y = (pos[1] / self.zoom) + self.camera_y
+        return (x, y)
+
+    def world_to_screen(self, pos):
+        """Convert world coordinates to screen coordinates"""
+        x = (pos[0] - self.camera_x) * self.zoom
+        y = (pos[1] - self.camera_y) * self.zoom
+        return (x, y)
+
+    def zoom_at(self, screen_pos, factor):
+        """Zoom centered on a screen position"""
+        # Get world position before zoom
+        world_x = (screen_pos[0] / self.zoom) + self.camera_x
+        world_y = (screen_pos[1] / self.zoom) + self.camera_y
+
+        # Apply zoom
+        new_zoom = max(self.zoom_min, min(self.zoom_max, self.zoom * factor))
+        if new_zoom != self.zoom:
+            self.zoom = new_zoom
+            # Adjust camera so the world point stays at the same screen position
+            self.camera_x = world_x - (screen_pos[0] / self.zoom)
+            self.camera_y = world_y - (screen_pos[1] / self.zoom)
+
+    def handle_toolbar_click(self, pos):
+        """Handle clicks on toolbar buttons. Returns True if handled."""
+        for rect, action in self.toolbar_buttons:
+            if rect.collidepoint(pos):
+                if isinstance(action, EditorTool):
+                    self.current_tool = action
+                elif action == "zoom_in":
+                    center = (self.play_area.width // 2, WINDOW_HEIGHT // 2)
+                    self.zoom_at(center, 1.2)
+                elif action == "zoom_out":
+                    center = (self.play_area.width // 2, WINDOW_HEIGHT // 2)
+                    self.zoom_at(center, 0.8)
+                elif action == "zoom_reset":
+                    self.zoom = 1.0
+                    self.camera_x = 0
+                    self.camera_y = 0
+                elif action == "floor_1":
+                    self.current_floor = 1
+                elif action == "floor_2":
+                    self.current_floor = 2
+                return True
+        return False
+
+    def get_linked_stair(self, stair) -> Optional[Stair]:
+        """Get the stair portal linked to this one"""
+        if stair.linked_stair_id < 0:
+            return None
+        for s in self.stairs:
+            if s.id == stair.linked_stair_id:
+                return s
+        return None
 
     def reset_simulation(self):
         self.students = []
@@ -2182,7 +2716,7 @@ class DiningHallSimulation:
 
     def clear_layout(self):
         self.save_undo_state()
-        self.stations, self.tables, self.walls, self.entrances, self.exits, self.dish_returns = [], [], [], [], [], []
+        self.stations, self.tables, self.walls, self.entrances, self.exits, self.dish_returns, self.stairs = [], [], [], [], [], [], []
         self.selected_item = None
         self.hide_all_panels()
         self.reset_simulation()
@@ -2190,8 +2724,9 @@ class DiningHallSimulation:
 
     def run(self):
         print("=" * 50)
-        print("DINING HALL FLOW SIMULATOR v2.5")
-        print("Press L to load image, 0-6 for tools")
+        print("DINING HALL FLOW SIMULATOR v2.6")
+        print("Click toolbar buttons or press 0-7 for tools")
+        print("Scroll=Zoom, Middle-drag=Pan, F1/F2=Floors")
         print("D=debug paths, F=recalc routes")
         print("Ctrl+Z=undo, Ctrl+Y=redo")
         print("SPACE to run, click students for stats")
@@ -2203,7 +2738,7 @@ class DiningHallSimulation:
                     self.running = False
 
                 # Panels handle events first
-                if self.station_panel.handle_event(event) or self.table_panel.handle_event(event) or self.dish_panel.handle_event(event):
+                if self.station_panel.handle_event(event) or self.table_panel.handle_event(event) or self.dish_panel.handle_event(event) or self.stair_panel.handle_event(event):
                     continue
 
                 if event.type == pygame.KEYDOWN:
@@ -2258,7 +2793,7 @@ class DiningHallSimulation:
                     elif self.editor_mode:
                         tools = {pygame.K_0: EditorTool.SELECT, pygame.K_1: EditorTool.STATION, pygame.K_2: EditorTool.TABLE,
                                 pygame.K_3: EditorTool.WALL, pygame.K_4: EditorTool.ENTRANCE, pygame.K_5: EditorTool.EXIT,
-                                pygame.K_6: EditorTool.DISH_RETURN}
+                                pygame.K_6: EditorTool.DISH_RETURN, pygame.K_7: EditorTool.STAIR}
                         if event.key in tools:
                             self.current_tool = tools[event.key]
 
@@ -2269,12 +2804,25 @@ class DiningHallSimulation:
                         ratio = (event.pos[0] - self.spawn_slider_rect.x) / self.spawn_slider_rect.width
                         ratio = max(0, min(1, ratio))
                         self.spawn_rate = int(STUDENT_SPAWN_RATE_MAX - ratio * (STUDENT_SPAWN_RATE_MAX - STUDENT_SPAWN_RATE_MIN))
+                    # Check toolbar button clicks in editor mode
+                    elif self.editor_mode and self.handle_toolbar_click(event.pos):
+                        pass  # Toolbar handled the click
+                    # Middle mouse button to start panning
+                    elif event.button == 2:
+                        self.dragging_camera = True
+                        self.last_mouse_pos = event.pos
+                    # Scroll wheel for zoom
+                    elif event.button == 4:  # Scroll up
+                        self.zoom_at(event.pos, 1.1)
+                    elif event.button == 5:  # Scroll down
+                        self.zoom_at(event.pos, 0.9)
                     elif self.editor_mode:
                         if event.pos[1] < WINDOW_HEIGHT - 50 and event.pos[0] < self.play_area.width:
-                            self.handle_editor_click(event.pos, event.button)
+                            self.handle_editor_click(self.screen_to_world(event.pos), event.button)
                     elif self.paused and event.pos[0] < self.play_area.width:
                         # Click on student when paused
-                        student = self.get_student_at(event.pos)
+                        world_pos = self.screen_to_world(event.pos)
+                        student = self.get_student_at(world_pos)
                         if student:
                             self.selected_student = student
                             self.student_panel.show(student)
@@ -2284,14 +2832,21 @@ class DiningHallSimulation:
 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     self.dragging_spawn_slider = False
+                    self.dragging_camera = False
                     if self.editor_mode:
-                        self.handle_editor_release(event.pos)
+                        self.handle_editor_release(self.screen_to_world(event.pos))
 
                 elif event.type == pygame.MOUSEMOTION:
                     if self.dragging_spawn_slider and self.spawn_slider_rect:
                         ratio = (event.pos[0] - self.spawn_slider_rect.x) / self.spawn_slider_rect.width
                         ratio = max(0, min(1, ratio))
                         self.spawn_rate = int(STUDENT_SPAWN_RATE_MAX - ratio * (STUDENT_SPAWN_RATE_MAX - STUDENT_SPAWN_RATE_MIN))
+                    elif self.dragging_camera and self.last_mouse_pos:
+                        dx = event.pos[0] - self.last_mouse_pos[0]
+                        dy = event.pos[1] - self.last_mouse_pos[1]
+                        self.camera_x -= dx / self.zoom
+                        self.camera_y -= dy / self.zoom
+                        self.last_mouse_pos = event.pos
 
             self.update()
             self.draw()
