@@ -1949,9 +1949,9 @@ class DiningHallSimulation:
     def update_student(self, student):
         student.time_in_system += 1
 
-        # Track position history for stuck detection
+        # Track position history for stuck detection - only when actually walking somewhere
         if student.state in [StudentState.WALKING_TO_STATION, StudentState.WALKING_TO_TABLE,
-                             StudentState.WALKING_TO_DISH_RETURN, StudentState.WAITING_FOR_FLOW]:
+                             StudentState.WALKING_TO_DISH_RETURN, StudentState.WALKING_TO_EXIT]:
             moved = math.hypot(student.x - student.prev_x, student.y - student.prev_y)
             if moved < STUCK_MOVEMENT_THRESHOLD:
                 student.truly_stuck_timer += 1
@@ -1966,9 +1966,8 @@ class DiningHallSimulation:
                 return
 
         if student.state == StudentState.ENTERING:
-            # Transition to looking around behavior
+            # Start looking around behavior - happens BEFORE choosing a station
             student.look_timer = random.randint(LOOK_AROUND_TIME_MIN, LOOK_AROUND_TIME_MAX)
-            # Pick a random nearby point to wander toward while looking
             angle = random.uniform(0, 2 * math.pi)
             student.look_target = (
                 student.x + math.cos(angle) * LOOK_AROUND_RADIUS,
@@ -1979,10 +1978,9 @@ class DiningHallSimulation:
             student.prev_y = student.y
 
         elif student.state == StudentState.LOOKING_AROUND:
-            # Slowly wander while "looking around" at stations
+            # Wander slowly while surveying options - NO station chosen yet
             student.look_timer -= 1
 
-            # Gently move toward look target (slower than normal)
             if student.look_target:
                 dx = student.look_target[0] - student.x
                 dy = student.look_target[1] - student.y
@@ -1994,33 +1992,30 @@ class DiningHallSimulation:
                     self.apply_wall_avoidance(student)
                     new_x = student.x + student.vx * self.speed
                     new_y = student.y + student.vy * self.speed
-                    # Keep in bounds (use world size)
                     new_x = max(STUDENT_RADIUS, min(self.world_width - STUDENT_RADIUS, new_x))
                     new_y = max(STUDENT_RADIUS, min(self.world_height - STUDENT_RADIUS, new_y))
                     student.x = new_x
                     student.y = new_y
                 else:
-                    # Pick new look target
+                    # Pick new wander target
                     angle = random.uniform(0, 2 * math.pi)
                     student.look_target = (
                         student.x + math.cos(angle) * LOOK_AROUND_RADIUS,
                         student.y + math.sin(angle) * LOOK_AROUND_RADIUS
                     )
 
-            # Done looking - now choose station
+            # Done looking - NOW choose station and commit to it
             if student.look_timer <= 0:
                 station = self.choose_station(student)
                 if station:
                     student.target_station = station
                     if station.is_flow_through:
-                        # Check if we need to wait in a natural queue
-                        self.assign_flow_queue_position(student, station)
+                        student.target = station.get_flow_entry_point()
                     else:
-                        # Join end of queue
                         queue_pos = len(station.queue) + len(station.being_served)
                         student.target = station.get_queue_position(queue_pos)
-                        student.path = self.pathfinder.find_path(student.pos, student.target)
-                        student.state = StudentState.WALKING_TO_STATION
+                    student.path = self.pathfinder.find_path(student.pos, student.target)
+                    student.state = StudentState.WALKING_TO_STATION
                 elif self.exits:
                     e = self.find_exit(student.pos)
                     student.target = e.center
@@ -2030,53 +2025,44 @@ class DiningHallSimulation:
         elif student.state == StudentState.WALKING_TO_STATION:
             station = student.target_station
             if station.is_flow_through:
+                # Simply walk to entry point and enter when there's space
                 if self.move_student(student, student.target):
-                    # Check if zone has space
                     if len(station.flow_positions) < 6:
                         station.flow_positions.append(student)
                         student.flow_progress = 0
                         student.state = StudentState.IN_FLOW_ZONE
-                        student.following_student = -1
-                    else:
-                        # Zone full - wait outside
-                        student.state = StudentState.WAITING_FOR_FLOW
+                    # If full, just wait at entry point (move_student returned True so we're there)
             else:
-                # Get current queue end position
+                # Regular queue - update target to current end of queue
                 queue_pos = len(station.queue) + len(station.being_served)
                 queue_target = station.get_queue_position(queue_pos)
 
-                # Count other students also walking to this station
-                others_approaching = [s for s in self.students
-                                     if s.id != student.id
-                                     and s.state == StudentState.WALKING_TO_STATION
-                                     and s.target_station == station]
-
-                # Calculate distance to queue target
                 dist_to_queue = math.hypot(student.x - queue_target[0], student.y - queue_target[1])
 
-                # If far from queue, spread out approach
+                # Spread out approaches when far away
                 if dist_to_queue > QUEUE_SPACING * 2:
-                    # Find this student's index among approachers (use id for consistency)
+                    others_approaching = [s for s in self.students
+                                         if s.id != student.id
+                                         and s.state == StudentState.WALKING_TO_STATION
+                                         and s.target_station == station]
                     approach_idx = sum(1 for s in others_approaching if s.id < student.id)
 
-                    # Add perpendicular offset based on index
                     dx, dy = 0, 0
                     if station.queue_direction in ["up", "down"]:
                         dx = (approach_idx - len(others_approaching) / 2) * APPROACH_SPREAD
                     else:
                         dy = (approach_idx - len(others_approaching) / 2) * APPROACH_SPREAD
-
                     student.target = (queue_target[0] + dx, queue_target[1] + dy)
                 else:
-                    # Close enough - head directly to queue position
                     student.target = queue_target
 
                 if self.move_student(student, student.target):
-                    # Only join queue if actually at queue position
                     if dist_to_queue < QUEUE_SPACING:
                         station.queue.append(student)
                         student.state = StudentState.QUEUING
                         student.stations_visited.append(station.name)
+
+        elif student.state == StudentState.IN_FLOW_ZONE:
 
         elif student.state == StudentState.WAITING_FOR_FLOW:
             # Natural queue waiting for flow-through zone
